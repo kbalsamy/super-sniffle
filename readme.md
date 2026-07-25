@@ -37,3 +37,4 @@ Bedrock policy
     }
   ]
 
+sed -n '492,560p' clis/heyCli.py | python heyCli.py --single "Review this function:"
