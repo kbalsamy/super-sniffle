@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""
+Universal AI CLI with Token & Cost Tracking
+Works with any OpenAI-compatible API + AWS Bedrock
+Tracks usage and persists to local JSON file.
+"""
+
+import os
+import sys
+import json
+import argparse
+from typing import Optional
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+
+from openai import OpenAI
+from rich.console import Console, Group
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.live import Live
+from rich.table import Table
+from rich import box
+
+
+# =============================================================================
+# PRICING DATABASE (USD per 1M tokens)
+# =============================================================================
+
+PRICING = {
+    # --- Moonshot / Kimi ---
+    "kimi-k3":              {"input": 0.71, "output": 2.94, "provider": "moonshot"},
+    "kimi-k2-thinking":     {"input": 0.71, "output": 2.94, "provider": "moonshot"},
+    "kimi-k2.5":            {"input": 0.72, "output": 3.60, "provider": "moonshot"},
+    "kimi-k2.6":            {"input": 0.72, "output": 3.60, "provider": "moonshot"},
+    "kimi-k2.7-code":       {"input": 0.72, "output": 3.60, "provider": "moonshot"},
+
+    # --- OpenAI ---
+    "gpt-4o":               {"input": 2.50, "output": 10.00, "provider": "openai"},
+    "gpt-4o-mini":          {"input": 0.15, "output": 0.60, "provider": "openai"},
+    "gpt-4-turbo":          {"input": 10.00, "output": 30.00, "provider": "openai"},
+    "o1":                   {"input": 15.00, "output": 60.00, "provider": "openai"},
+    "o3-mini":              {"input": 1.10, "output": 4.40, "provider": "openai"},
+
+    # --- DeepSeek ---
+    "deepseek-chat":        {"input": 0.14, "output": 0.28, "provider": "deepseek"},
+    "deepseek-reasoner":    {"input": 0.55, "output": 2.19, "provider": "deepseek"},
+
+    # --- Groq ---
+    "llama-3.3-70b-versatile":   {"input": 0.59, "output": 0.79, "provider": "groq"},
+    "llama-3.1-8b-instant":     {"input": 0.05, "output": 0.08, "provider": "groq"},
+    "mixtral-8x7b-32768":       {"input": 0.24, "output": 0.24, "provider": "groq"},
+
+    # --- AWS Bedrock (Claude) ---
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": {"input": 3.00, "output": 15.00, "provider": "bedrock"},
+    "anthropic.claude-3-haiku-20240307-v1:0":     {"input": 0.25, "output": 1.25, "provider": "bedrock"},
+    "anthropic.claude-3-opus-20240229-v1:0":      {"input": 15.00, "output": 75.00, "provider": "bedrock"},
+
+    # --- AWS Bedrock (Llama) ---
+    "meta.llama3-70b-instruct-v1:0":  {"input": 0.72, "output": 0.72, "provider": "bedrock"},
+    "meta.llama3-8b-instruct-v1:0":   {"input": 0.22, "output": 0.22, "provider": "bedrock"},
+
+    # --- AWS Bedrock (Mistral) ---
+    "mistral.mistral-large-2402-v1:0": {"input": 4.00, "output": 12.00, "provider": "bedrock"},
+
+    # --- AWS Bedrock (Amazon Titan) ---
+    "amazon.titan-text-express-v1":    {"input": 0.20, "output": 0.60, "provider": "bedrock"},
+    "amazon.titan-text-lite-v1":       {"input": 0.15, "output": 0.20, "provider": "bedrock"},
+
+    # --- Qwen ---
+    "qwen-max":             {"input": 0.72, "output": 1.44, "provider": "qwen"},
+    "qwen-plus":            {"input": 0.36, "output": 0.72, "provider": "qwen"},
+    "qwen-turbo":           {"input": 0.072, "output": 0.072, "provider": "qwen"},
+
+    # --- Ollama (Local - free) ---
+    "llama3.2":             {"input": 0.0, "output": 0.0, "provider": "ollama"},
+    "llama3.1":             {"input": 0.0, "output": 0.0, "provider": "ollama"},
+    "mistral":              {"input": 0.0, "output": 0.0, "provider": "ollama"},
+}
+
+
+def get_pricing(model_id: str) -> dict:
+    """Get pricing for a model. Falls back to generic lookup or defaults."""
+    # Exact match
+    if model_id in PRICING:
+        return PRICING[model_id]
+
+    # Partial match (for Bedrock full ARNs or versioned IDs)
+    for key, price in PRICING.items():
+        if key in model_id or model_id in key:
+            return price
+
+    # Default: unknown pricing
+    return {"input": 0.0, "output": 0.0, "provider": "unknown"}
+
+
+# =============================================================================
+# USAGE TRACKER
+# =============================================================================
+
+@dataclass
+class SessionUsage:
+    """Tracks usage for a single session."""
+    provider: str
+    model: str
+    messages_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cost_input: float = 0.0
+    cost_output: float = 0.0
+    cost_total: float = 0.0
+    start_time: str = field(default_factory=lambda: datetime.now().isoformat())
+    end_time: Optional[str] = None
+
+
+class UsageTracker:
+    """Persists usage data to local JSON file."""
+
+    def __init__(self, data_dir: Optional[Path] = None):
+        self.data_dir = data_dir or Path.home() / ".ai_cli"
+        self.data_dir.mkdir(exist_ok=True)
+        self.usage_file = self.data_dir / "usage_history.json"
+        self.sessions: list[dict] = self._load()
+        self.current_session: Optional[SessionUsage] = None
+
+    def _load(self) -> list[dict]:
+        if self.usage_file.exists():
+            try:
+                with open(self.usage_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return []
+        return []
+
+    def _save(self):
+        with open(self.usage_file, "w", encoding="utf-8") as f:
+            json.dump(self.sessions, f, indent=2, ensure_ascii=False)
+
+    def start_session(self, provider: str, model: str):
+        self.current_session = SessionUsage(provider=provider, model=model)
+
+    def record_turn(self, input_tokens: int, output_tokens: int, model: str):
+        """Record a single turn's usage."""
+        if self.current_session is None:
+            return
+
+        pricing = get_pricing(model)
+
+        self.current_session.messages_count += 1
+        self.current_session.input_tokens += input_tokens
+        self.current_session.output_tokens += output_tokens
+        self.current_session.total_tokens += input_tokens + output_tokens
+
+        # Cost = (tokens / 1,000,000) * price_per_1m
+        cost_in = (input_tokens / 1_000_000) * pricing["input"]
+        cost_out = (output_tokens / 1_000_000) * pricing["output"]
+
+        self.current_session.cost_input += cost_in
+        self.current_session.cost_output += cost_out
+        self.current_session.cost_total += cost_in + cost_out
+
+    def end_session(self):
+        if self.current_session:
+            self.current_session.end_time = datetime.now().isoformat()
+            self.sessions.append(asdict(self.current_session))
+            self._save()
+
+    def get_summary(self) -> Optional[SessionUsage]:
+        return self.current_session
+
+    def get_all_time_stats(self) -> dict:
+        """Aggregate stats across all sessions."""
+        if not self.sessions:
+            return {}
+
+        total_input = sum(s["input_tokens"] for s in self.sessions)
+        total_output = sum(s["output_tokens"] for s in self.sessions)
+        total_cost = sum(s["cost_total"] for s in self.sessions)
+
+        # Group by provider
+        by_provider = {}
+        for s in self.sessions:
+            p = s["provider"]
+            if p not in by_provider:
+                by_provider[p] = {"sessions": 0, "cost": 0.0, "tokens": 0}
+            by_provider[p]["sessions"] += 1
+            by_provider[p]["cost"] += s["cost_total"]
+            by_provider[p]["tokens"] += s["total_tokens"]
+
+        return {
+            "total_sessions": len(self.sessions),
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "total_tokens": total_input + total_output,
+            "total_cost_usd": total_cost,
+            "by_provider": by_provider,
+        }
+
+    def display_stats(self, console: Console):
+        """Display usage statistics in a rich table."""
+        stats = self.get_all_time_stats()
+        if not stats:
+            console.print("[dim]No usage data yet.[/dim]")
+            return
+
+        table = Table(
+            title="📊 All-Time Usage Statistics",
+            box=box.ROUNDED,
+            border_style="cyan",
+        )
+        table.add_column("Metric", style="bold")
+        table.add_column("Value", justify="right")
+
+        table.add_row("Total Sessions", str(stats["total_sessions"]))
+        table.add_row("Total Input Tokens", f"{stats['total_input_tokens']:,}")
+        table.add_row("Total Output Tokens", f"{stats['total_output_tokens']:,}")
+        table.add_row("Total Tokens", f"{stats['total_tokens']:,}")
+        table.add_row("Total Cost", f"${stats['total_cost_usd']:.6f}")
+
+        console.print(table)
+
+        # Provider breakdown
+        if stats["by_provider"]:
+            prov_table = Table(
+                title="By Provider",
+                box=box.SIMPLE,
+                border_style="blue",
+            )
+            prov_table.add_column("Provider", style="bold")
+            prov_table.add_column("Sessions", justify="right")
+            prov_table.add_column("Tokens", justify="right")
+            prov_table.add_column("Cost", justify="right")
+
+            for provider, data in stats["by_provider"].items():
+                prov_table.add_row(
+                    provider,
+                    str(data["sessions"]),
+                    f"{data['tokens']:,}",
+                    f"${data['cost']:.6f}",
+                )
+
+            console.print(prov_table)
+
+    def display_session_summary(self, console: Console):
+        """Display current session summary."""
+        if not self.current_session:
+            return
+
+        s = self.current_session
+        table = Table(box=box.SIMPLE, border_style="green", show_header=False)
+        table.add_column("", style="dim")
+        table.add_column("", justify="right")
+
+        table.add_row("Messages", str(s.messages_count))
+        table.add_row("Input Tokens", f"{s.input_tokens:,}")
+        table.add_row("Output Tokens", f"{s.output_tokens:,}")
+        table.add_row("Total Tokens", f"{s.total_tokens:,}")
+        table.add_row("Cost (Input)", f"${s.cost_input:.6f}")
+        table.add_row("Cost (Output)", f"${s.cost_output:.6f}")
+        table.add_row("[bold]Total Cost[/bold]", f"[bold]${s.cost_total:.6f}[/bold]")
+
+        console.print(
+            Panel(table, title="💰 Current Session", border_style="green", expand=False)
+        )
+
+
+# =============================================================================
+# PROVIDER CONFIGS
+# =============================================================================
+
+@dataclass
+class ProviderConfig:
+    name: str
+    base_url: str
+    model: str
+    api_key_env: str
+    supports_reasoning: bool = False
+    reasoning_param: Optional[str] = None
+    supports_streaming: bool = True
+    system_role: str = "system"
+    is_bedrock: bool = False
+
+
+PROVIDERS = {
+    "moonshot": ProviderConfig(
+        name="Moonshot (Kimi)",
+        base_url="https://api.moonshot.cn/v1",
+        model="kimi-k3",
+        api_key_env="MOONSHOT_API_KEY",
+        supports_reasoning=True,
+        reasoning_param="reasoning_effort",
+    ),
+    "openai": ProviderConfig(
+        name="OpenAI",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o",
+        api_key_env="OPENAI_API_KEY",
+        supports_reasoning=True,
+        reasoning_param="reasoning_effort",
+    ),
+    "deepseek": ProviderConfig(
+        name="DeepSeek",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        api_key_env="DEEPSEEK_API_KEY",
+        supports_reasoning=True,
+        reasoning_param="reasoning_effort",
+    ),
+    "groq": ProviderConfig(
+        name="Groq",
+        base_url="https://api.groq.com/openai/v1",
+        model="llama-3.3-70b-versatile",
+        api_key_env="GROQ_API_KEY",
+    ),
+    "ollama": ProviderConfig(
+        name="Ollama (Local)",
+        base_url="http://localhost:11434/v1",
+        model="llama3.2",
+        api_key_env="OLLAMA_API_KEY",
+    ),
+    "qwen": ProviderConfig(
+        name="Alibaba Qwen",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen-max",
+        api_key_env="DASHSCOPE_API_KEY",
+    ),
+    "bedrock": ProviderConfig(
+        name="AWS Bedrock",
+        base_url="",  # Not used; boto3 handles it
+        model="moonshot.kimi-k2-thinking",
+        api_key_env="AWS_ACCESS_KEY_ID",
+        is_bedrock=True,
+    ),
+
+    "bedrock-mantle": ProviderConfig(
+            name="AWS Bedrock",
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1",
+            model="moonshot.kimi-k2-thinking",
+            api_key_env="AI_API_KEY",            
+        ),
+    # connect to AWS Bedrock using RestAPI
+    "custom": ProviderConfig(
+        name="Custom",
+        base_url="",
+        model="",
+        api_key_env="AI_API_KEY"
+      
+    ),
+}
+
+
+# =============================================================================
+# UNIVERSAL AI CLI
+# =============================================================================
+
+class UniversalAICli:
+    def __init__(
+        self,
+        provider: str = "custom",
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        reasoning: Optional[str] = None,
+        region: str = "ap-south-1",
+        profile: Optional[str] = None,
+    ):
+        self.config = PROVIDERS.get(provider, PROVIDERS["custom"])
+        self.provider_name = provider
+
+        if model:
+            self.config.model = model
+        if base_url:
+            self.config.base_url = base_url
+
+        self.api_key = api_key or os.environ.get(self.config.api_key_env)
+        self.reasoning = reasoning
+        self.region = region
+        self.profile = profile
+
+        self.console = Console()
+        self.messages: list[dict] = []
+        self.history_file = os.path.expanduser(f"~/.ai_cli_{provider}_history")
+
+        # Token & cost tracking
+        self.tracker = UsageTracker()
+        self.tracker.start_session(provider, self.config.model)
+
+        # Initialize client
+        if self.config.is_bedrock:
+            self._init_bedrock()
+        else:
+            self._init_openai()
+
+    def _init_openai(self):
+        client_kwargs = {"base_url": self.config.base_url}
+        if self.api_key:
+            client_kwargs["api_key"] = self.api_key
+        else:
+            client_kwargs["api_key"] = "dummy"
+        self.client = OpenAI(**client_kwargs)
+        self.bedrock_client = None
+
+    def _init_bedrock(self):
+        import boto3
+        from botocore.config import Config
+
+        session_kwargs = {}
+        if self.profile:
+            session_kwargs["profile_name"] = self.profile
+
+        session = boto3.Session(**session_kwargs)
+        self.bedrock_client = session.client(
+            "bedrock-runtime",
+            region_name=self.region,
+            config=Config(retries={"max_attempts": 3}),
+        )
+        self.client = None
+
+    def _build_request(self, messages: list, stream: bool = True) -> dict:
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if (
+            self.config.supports_reasoning
+            and self.reasoning
+            and self.config.reasoning_param
+        ):
+            payload[self.config.reasoning_param] = self.reasoning
+        return payload
+
+    def _extract_content(self, delta_or_message) -> tuple[str, Optional[str]]:
+        content = getattr(delta_or_message, "content", "") or ""
+        reasoning = getattr(delta_or_message, "reasoning_content", None)
+        return content, reasoning
+
+    def _extract_usage(self, response) -> tuple[int, int]:
+        """Extract token usage from response. Returns (input_tokens, output_tokens)."""
+        # OpenAI-style usage
+        if hasattr(response, "usage") and response.usage:
+            usage = response.usage
+            return getattr(usage, "prompt_tokens", 0), getattr(usage, "completion_tokens", 0)
+
+        # Bedrock non-streaming
+        if isinstance(response, dict) and "usage" in response:
+            u = response["usage"]
+            return u.get("inputTokens", 0), u.get("outputTokens", 0)
+
+        return 0, 0
+
+    def _print_banner(self):
+        pricing = get_pricing(self.config.model)
+        cost_info = f"${pricing['input']}/1M in, ${pricing['output']}/1M out" if pricing["provider"] != "unknown" else "Pricing unknown"
+
+        banner = Panel.fit(
+            f"[bold cyan]🤖 {self.config.name} CLI[/bold cyan]\n"
+            f"[dim]Model: {self.config.model}[/dim]\n"
+            f"[dim]Pricing: {cost_info}[/dim]\n"
+            f"[dim]Commands: /clear, /save, /load, /history, /stats, /cost, /model, /quit[/dim]",
+            title="Universal AI CLI",
+            border_style="cyan",
+        )
+        self.console.print(banner)
+
+    def _record_usage(self, response, streamed: bool = False):
+        """Record token usage from a response object."""
+        input_tokens, output_tokens = 0, 0
+
+        if streamed:
+            # For streaming, we try to get usage from the final chunk
+            # OpenAI: usage is in the last chunk if stream_options.include_usage=True
+            # Bedrock: usage is in the final metadata event
+            pass  # We'll estimate or get from non-stream if possible
+        else:
+            input_tokens, output_tokens = self._extract_usage(response)
+
+        if input_tokens or output_tokens:
+            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+            self.tracker.display_session_summary(self.console)
+
+    def _stream_chat(self, user_input: str) -> str:
+        self.messages.append({"role": "user", "content": user_input})
+
+        try:
+            if self.config.is_bedrock:
+                return self._bedrock_stream_chat(user_input)
+            else:
+                return self._openai_stream_chat(user_input)
+        except Exception as e:
+            self.console.print(f"[red]API Error: {e}[/red]")
+            self.messages.pop()
+            return ""
+
+    def _openai_stream_chat(self, user_input: str) -> str:
+        request = self._build_request(self.messages, stream=True)
+        # Request usage in stream
+        request["stream_options"] = {"include_usage": True}
+
+        response = self.client.chat.completions.create(**request)
+
+        full_content = ""
+        reasoning_content = ""
+        input_tokens = 0
+        output_tokens = 0
+
+        def render():
+            parts = []
+            if reasoning_content:
+                parts.append(
+                    Panel(
+                        Markdown(reasoning_content),
+                        title="[yellow]Reasoning Process[/yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    )
+                )
+            if full_content:
+                parts.append(Markdown(full_content))
+            return Group(*parts)
+
+        with Live(console=self.console, refresh_per_second=15) as live:
+            for chunk in response:
+                # Capture usage from final chunk
+                if hasattr(chunk, "usage") and chunk.usage:
+                    input_tokens = getattr(chunk.usage, "prompt_tokens", 0)
+                    output_tokens = getattr(chunk.usage, "completion_tokens", 0)
+
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+                content, reasoning = self._extract_content(delta)
+
+                if reasoning:
+                    reasoning_content += reasoning
+                    live.update(render())
+
+                if content:
+                    full_content += content
+                    live.update(render())
+
+        self.console.print()
+
+        self.messages.append({"role": "assistant", "content": full_content})
+
+        # Record usage
+        if input_tokens or output_tokens:
+            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+            self.tracker.display_session_summary(self.console)
+
+        return full_content
+
+    def _bedrock_stream_chat(self, user_input: str) -> str:
+        """Stream chat using Bedrock ConverseStream API."""
+        import boto3
+
+        # Convert messages to Bedrock format
+        bedrock_msgs = []
+        system_text = None
+        for msg in self.messages:
+            if msg["role"] == "system":
+                system_text = msg["content"]
+                continue
+            bedrock_role = "user" if msg["role"] == "user" else "assistant"
+            bedrock_msgs.append({
+                "role": bedrock_role,
+                "content": [{"text": msg["content"]}],
+            })
+
+        kwargs = {
+            "modelId": self.config.model,
+            "messages": bedrock_msgs,
+        }
+        if system_text:
+            kwargs["system"] = [{"text": system_text}]
+
+        response = self.bedrock_client.converse_stream(**kwargs)
+        stream = response.get("stream")
+
+        full_content = ""
+        input_tokens = 0
+        output_tokens = 0
+
+        with Live(console=self.console, refresh_per_second=15) as live:
+            for event in stream:
+                if "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"]["delta"]
+                    if "text" in delta:
+                        full_content += delta["text"]
+                        live.update(Markdown(full_content))
+
+                # Capture usage from metadata event
+                if "metadata" in event:
+                    usage = event["metadata"].get("usage", {})
+                    input_tokens = usage.get("inputTokens", 0)
+                    output_tokens = usage.get("outputTokens", 0)
+
+        self.console.print()
+
+        self.messages.append({"role": "assistant", "content": full_content})
+
+        if input_tokens or output_tokens:
+            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+            self.tracker.display_session_summary(self.console)
+
+        return full_content
+
+    def _non_stream_chat(self, user_input: str) -> str:
+        self.messages.append({"role": "user", "content": user_input})
+
+        try:
+            if self.config.is_bedrock:
+                return self._bedrock_non_stream_chat(user_input)
+            else:
+                return self._openai_non_stream_chat(user_input)
+        except Exception as e:
+            self.console.print(f"[red]API Error: {e}[/red]")
+            self.messages.pop()
+            return ""
+
+    def _openai_non_stream_chat(self, user_input: str) -> str:
+        request = self._build_request(self.messages, stream=False)
+        response = self.client.chat.completions.create(**request)
+
+        message = response.choices[0].message
+        content, reasoning = self._extract_content(message)
+
+        if reasoning:
+            self.console.print(
+                Panel(
+                    Markdown(reasoning),
+                    title="[yellow]Reasoning Process[/yellow]",
+                    border_style="yellow",
+                    expand=False,
+                )
+            )
+
+        self.console.print(Markdown(content))
+        self.console.print()
+
+        self.messages.append({"role": "assistant", "content": content})
+
+        # Record usage
+        input_tokens, output_tokens = self._extract_usage(response)
+        if input_tokens or output_tokens:
+            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+            self.tracker.display_session_summary(self.console)
+
+        return content
+
+    def _bedrock_non_stream_chat(self, user_input: str) -> str:
+        """Non-stream chat using Bedrock Converse API."""
+        bedrock_msgs = []
+        system_text = None
+        for msg in self.messages:
+            if msg["role"] == "system":
+                system_text = msg["content"]
+                continue
+            bedrock_role = "user" if msg["role"] == "user" else "assistant"
+            bedrock_msgs.append({
+                "role": bedrock_role,
+                "content": [{"text": msg["content"]}],
+            })
+
+        kwargs = {
+            "modelId": self.config.model,
+            "messages": bedrock_msgs,
+        }
+        if system_text:
+            kwargs["system"] = [{"text": system_text}]
+
+        response = self.bedrock_client.converse(**kwargs)
+
+        output = response["output"]["message"]["content"][0]["text"]
+        self.console.print(Markdown(output))
+        self.console.print()
+
+        self.messages.append({"role": "assistant", "content": output})
+
+        # Record usage
+        usage = response.get("usage", {})
+        input_tokens = usage.get("inputTokens", 0)
+        output_tokens = usage.get("outputTokens", 0)
+        if input_tokens or output_tokens:
+            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+            self.tracker.display_session_summary(self.console)
+
+        return output
+
+    def _handle_command(self, cmd: str) -> bool:
+        cmd = cmd.strip().lower()
+
+        if cmd in ("/quit", "/q", "exit"):
+            self.tracker.end_session()
+            self.console.print("[dim]Goodbye! 👋[/dim]")
+            return False
+
+        elif cmd == "/clear":
+            self.messages = []
+            self.console.print("[green]Conversation history cleared.[/green]")
+            return True
+
+        elif cmd == "/history":
+            if not self.messages:
+                self.console.print("[yellow]No history yet.[/yellow]")
+                return True
+            history_text = []
+            for m in self.messages:
+                role_color = "green" if m["role"] == "user" else "cyan"
+                preview = str(m.get("content", ""))[:100]
+                history_text.append(
+                    f"[{role_color}]{m['role'].upper()}[/]: {preview}..."
+                )
+            self.console.print(
+                Panel(
+                    "\n".join(history_text),
+                    title="Conversation History",
+                    border_style="blue",
+                )
+            )
+            return True
+
+        elif cmd == "/stats":
+            self.tracker.display_stats(self.console)
+            return True
+
+        elif cmd == "/cost":
+            self.tracker.display_session_summary(self.console)
+            return True
+
+        elif cmd == "/save":
+            try:
+                with open(self.history_file, "w", encoding="utf-8") as f:
+                    json.dump(self.messages, f, ensure_ascii=False, indent=2)
+                self.console.print(
+                    f"[green]History saved to {self.history_file}[/green]"
+                )
+            except Exception as e:
+                self.console.print(f"[red]Save failed: {e}[/red]")
+            return True
+
+        elif cmd == "/load":
+            try:
+                with open(self.history_file, "r", encoding="utf-8") as f:
+                    self.messages = json.load(f)
+                self.console.print(
+                    f"[green]History loaded from {self.history_file}[/green]"
+                )
+            except FileNotFoundError:
+                self.console.print("[red]No saved history found.[/red]")
+            except Exception as e:
+                self.console.print(f"[red]Load failed: {e}[/red]")
+            return True
+
+        elif cmd.startswith("/model "):
+            new_model = cmd[7:].strip()
+            if new_model:
+                self.config.model = new_model
+                self.tracker.current_session.model = new_model
+                self.console.print(f"[green]Model switched to: {new_model}[/green]")
+            return True
+
+        elif cmd.startswith("/"):
+            self.console.print(
+                "[yellow]Unknown command. Try: /clear, /save, /load, "
+                "/history, /stats, /cost, /model <name>, /quit[/yellow]"
+            )
+            return True
+
+        return True
+
+    def _set_system_prompt(self, system_prompt: Optional[str]):
+        if system_prompt and self.config.system_role:
+            self.messages.append({
+                "role": self.config.system_role,
+                "content": system_prompt,
+            })
+
+    def run(self, stream: bool = True, system_prompt: Optional[str] = None):
+        self._set_system_prompt(system_prompt)
+
+        self._print_banner()
+
+        while True:
+            try:
+                user_input = Prompt.ask("[bold green]You[/bold green]")
+            except (EOFError, KeyboardInterrupt):
+                self.tracker.end_session()
+                self.console.print("\n[dim]Goodbye! 👋[/dim]")
+                break
+
+            if not user_input.strip():
+                continue
+
+            if not self._handle_command(user_input):
+                break
+
+            if user_input.strip().startswith("/"):
+                continue
+
+            self.console.print(f"[bold cyan]{self.config.model}[/bold cyan]", end=" ")
+
+            if stream:
+                self._stream_chat(user_input)
+            else:
+                self._non_stream_chat(user_input)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HeyBro")
+    parser.add_argument(
+        "--provider",
+        choices=list(PROVIDERS.keys()),
+        default="custom",
+        help="API provider (default: custom)",
+    )
+    parser.add_argument("--model", help="Override default model")
+    parser.add_argument("--base-url", help="Override API base URL")
+    parser.add_argument("--api-key", help="API key")
+    parser.add_argument(
+        "--reasoning",
+        choices=["low", "high", "max"],
+        help="Reasoning effort (provider-dependent)"
+    )
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming")
+    parser.add_argument(
+        "--system",
+        default=(
+            "You are a senior code reviewer. Given a diff, file, or snippet, find "
+            "concrete issues: bugs, security problems, missed edge cases, unclear "
+            "naming. Skip praise and style nitpicks unless asked. For each issue, "
+            "give the file/line if known, a one-line description of the problem, "
+            "and a concrete fix as a code snippet. Rank issues by severity, most "
+            "severe first. Keep prose short; let code do the talking. If the input "
+            "isn't code to review, just answer the question concisely."
+        ),
+        help="System prompt",
+    )
+    parser.add_argument(
+        "--single",
+        metavar="PROMPT",
+        help="Single prompt mode (use '-' to read the prompt entirely from stdin)",
+    )
+    parser.add_argument("--region", default="us-east-1", help="AWS region (for Bedrock)")
+    parser.add_argument("--profile", help="AWS profile (for Bedrock)")
+    args = parser.parse_args()
+
+    stdin_content = None
+    if not sys.stdin.isatty():
+        stdin_content = sys.stdin.read().strip("\n")
+
+    if args.single == "-":
+        if not stdin_content:
+            print("Error: --single - requires piped input on stdin")
+            sys.exit(1)
+        args.single = stdin_content
+    elif args.single and stdin_content:
+        # Piped input alongside an inline prompt: treat the prompt as
+        # instructions and the piped content (e.g. `git diff`) as context.
+        args.single = f"{args.single}\n\n{stdin_content}"
+    elif not args.single and stdin_content:
+        args.single = stdin_content
+
+    try:
+        cli = UniversalAICli(
+            provider=args.provider,
+            model=args.model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            reasoning=args.reasoning,
+            region=args.region,
+            profile=args.profile,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    if args.single:
+        cli._set_system_prompt(args.system)
+        cli._print_banner()
+        cli.console.print(f"[bold green]You[/bold green]: {args.single}")
+        cli.console.print(f"[bold cyan]{cli.config.model}[/bold cyan]: ", end="")
+        if args.no_stream:
+            cli._non_stream_chat(args.single)
+        else:
+            cli._stream_chat(args.single)
+        cli.tracker.end_session()
+    else:
+        try:
+            cli.run(stream=not args.no_stream, system_prompt=args.system)
+        finally:
+            cli.tracker.end_session()
+
+
+if __name__ == "__main__":
+    main()
+
+
