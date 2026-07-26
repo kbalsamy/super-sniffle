@@ -38,3 +38,9 @@ Bedrock policy
   ]
 
 sed -n '492,560p' clis/heybro.py | python heyCli.py --single "Review this function:"
+
+review() {
+  local dir="${1:-.}"
+  local provider="${2:-bedrock}"
+  (cd "$dir" && git diff) | ../env/bin/python ..heyCli.py --provider "$provider" --single -
+}
