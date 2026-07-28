@@ -22,6 +22,7 @@ from rich.prompt import Prompt
 from rich.live import Live
 from rich.table import Table
 from rich import box
+from rich.spinner import Spinner
 
 
 # =============================================================================
@@ -459,7 +460,7 @@ class UniversalAICli:
             f"[bold cyan]🤖 {self.config.name} CLI[/bold cyan]\n"
             f"[dim]Model: {self.config.model}[/dim]\n"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /save, /load, /history, /stats, /cost, /model, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /model, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -479,7 +480,7 @@ class UniversalAICli:
 
         if input_tokens or output_tokens:
             self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
-            self.tracker.display_session_summary(self.console)
+            # self.tracker.display_session_summary(self.console)
 
     def _stream_chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
@@ -520,8 +521,8 @@ class UniversalAICli:
             if full_content:
                 parts.append(Markdown(full_content))
             return Group(*parts)
-
-        with Live(console=self.console, refresh_per_second=15) as live:
+        waiting = Spinner("dots", text=" Waiting for response...")
+        with Live(waiting, console=self.console, refresh_per_second=15) as live:
             for chunk in response:
                 # Capture usage from final chunk
                 if hasattr(chunk, "usage") and chunk.usage:
@@ -549,7 +550,7 @@ class UniversalAICli:
         # Record usage
         if input_tokens or output_tokens:
             self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
-            self.tracker.display_session_summary(self.console)
+            # self.tracker.display_session_summary(self.console)
 
         return full_content
 
@@ -583,8 +584,8 @@ class UniversalAICli:
         full_content = ""
         input_tokens = 0
         output_tokens = 0
-
-        with Live(console=self.console, refresh_per_second=15) as live:
+        waiting = Spinner("dots", text=" Waiting for response...")
+        with Live(waiting, console=self.console, refresh_per_second=15) as live:
             for event in stream:
                 if "contentBlockDelta" in event:
                     delta = event["contentBlockDelta"]["delta"]
@@ -604,7 +605,7 @@ class UniversalAICli:
 
         if input_tokens or output_tokens:
             self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
-            self.tracker.display_session_summary(self.console)
+            # self.tracker.display_session_summary(self.console)
 
         return full_content
 
@@ -647,7 +648,7 @@ class UniversalAICli:
         input_tokens, output_tokens = self._extract_usage(response)
         if input_tokens or output_tokens:
             self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
-            self.tracker.display_session_summary(self.console)
+            # self.tracker.display_session_summary(self.console)
 
         return content
 
@@ -686,7 +687,7 @@ class UniversalAICli:
         output_tokens = usage.get("outputTokens", 0)
         if input_tokens or output_tokens:
             self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
-            self.tracker.display_session_summary(self.console)
+            # self.tracker.display_session_summary(self.console)
 
         return output
 
@@ -701,6 +702,10 @@ class UniversalAICli:
         elif cmd == "/clear":
             self.messages = []
             self.console.print("[green]Conversation history cleared.[/green]")
+            return True
+
+        elif cmd == "/clear-console":
+            self.console.clear()
             return True
 
         elif cmd == "/history":
@@ -765,7 +770,7 @@ class UniversalAICli:
 
         elif cmd.startswith("/"):
             self.console.print(
-                "[yellow]Unknown command. Try: /clear, /save, /load, "
+                "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
                 "/history, /stats, /cost, /model <name>, /quit[/yellow]"
             )
             return True
