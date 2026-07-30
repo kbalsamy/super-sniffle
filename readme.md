@@ -47,4 +47,3 @@ review() {
 
 Inference ARN:                                                                                                        │
 │ arn:aws:bedrock:ap-south-1:<Account-id>:inference-profile/apac.anthropic.claude-3-5-sonnet-20240620-v1:0 
-  arn:aws:bedrock:ap-south-1:<>:application-inference-profile/17le0dkwykwz
