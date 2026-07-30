@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import argparse
+import subprocess
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -23,6 +24,7 @@ from rich.live import Live
 from rich.table import Table
 from rich import box
 from rich.spinner import Spinner
+from rich.markup import escape
 
 
 # =============================================================================
@@ -83,6 +85,9 @@ PRICING = {
 
 def get_pricing(model_id: str) -> dict:
     """Get pricing for a model. Falls back to generic lookup or defaults."""
+    if not model_id:
+        return {"input": 0.0, "output": 0.0, "provider": "unknown"}
+
     # Exact match
     if model_id in PRICING:
         return PRICING[model_id]
@@ -366,10 +371,12 @@ class UniversalAICli:
         reasoning: Optional[str] = None,
         region: str = "ap-south-1",
         profile: Optional[str] = None,
+        model_arn: Optional[str] = None,
     ):
         self.config = PROVIDERS.get(provider, PROVIDERS["custom"])
         self.provider_name = provider
 
+        self.model_explicit = bool(model)
         if model:
             self.config.model = model
         if base_url:
@@ -379,6 +386,7 @@ class UniversalAICli:
         self.reasoning = reasoning
         self.region = region
         self.profile = profile
+        self.model_arn = model_arn
 
         self.console = Console()
         self.messages: list[dict] = []
@@ -453,14 +461,30 @@ class UniversalAICli:
         return 0, 0
 
     def _print_banner(self):
-        pricing = get_pricing(self.config.model)
-        cost_info = f"${pricing['input']}/1M in, ${pricing['output']}/1M out" if pricing["provider"] != "unknown" else "Pricing unknown"
+        model_name = self.config.model
+        if not self.model_explicit and self.model_arn:
+            # --model was left at its provider default while --model-arn points
+            # elsewhere; that default is misleading, so derive a display/pricing
+            # name from the ARN's trailing segment instead
+            # (e.g. "us.anthropic.claude-sonnet-4-5-...-v1:0").
+            model_name = self.model_arn.rsplit("/", 1)[-1]
+        display_model = model_name or "unknown"
+
+        pricing = get_pricing(model_name)
+        cost_info = (
+            f"${pricing['input']}/1M in, ${pricing['output']}/1M out"
+            if pricing["provider"] != "unknown"
+            else "Pricing unknown (model not mapped)"
+        )
+
+        arn_line = f"[dim]Inference ARN: {escape(self.model_arn)}[/dim]\n" if self.model_arn else ""
 
         banner = Panel.fit(
             f"[bold cyan]🤖 {self.config.name} CLI[/bold cyan]\n"
-            f"[dim]Model: {self.config.model}[/dim]\n"
+            f"[dim]Model: {escape(display_model)}[/dim]\n"
+            f"{arn_line}"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /model, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /model, /model-arn <arn>, /read <path>, /run <cmd>, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -491,7 +515,7 @@ class UniversalAICli:
             else:
                 return self._openai_stream_chat(user_input)
         except Exception as e:
-            self.console.print(f"[red]API Error: {e}[/red]")
+            self.console.print(f"[red]API Error: {escape(str(e))}[/red]")
             self.messages.pop()
             return ""
 
@@ -572,7 +596,7 @@ class UniversalAICli:
             })
 
         kwargs = {
-            "modelId": self.config.model,
+            "modelId": self.model_arn or self.config.model,
             "messages": bedrock_msgs,
         }
         if system_text:
@@ -618,7 +642,7 @@ class UniversalAICli:
             else:
                 return self._openai_non_stream_chat(user_input)
         except Exception as e:
-            self.console.print(f"[red]API Error: {e}[/red]")
+            self.console.print(f"[red]API Error: {escape(str(e))}[/red]")
             self.messages.pop()
             return ""
 
@@ -667,7 +691,7 @@ class UniversalAICli:
             })
 
         kwargs = {
-            "modelId": self.config.model,
+            "modelId": self.model_arn or self.config.model,
             "messages": bedrock_msgs,
         }
         if system_text:
@@ -691,8 +715,76 @@ class UniversalAICli:
 
         return output
 
+    def _read_file_into_context(self, file_path: str):
+        if not file_path:
+            self.console.print("[red]Usage: /read <file_path>[/red]")
+            return
+        path = Path(file_path).expanduser()
+        try:
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self.console.print(f"[red]File not found: {escape(str(path))}[/red]")
+            return
+        except IsADirectoryError:
+            self.console.print(f"[red]Not a file: {escape(str(path))}[/red]")
+            return
+        except UnicodeDecodeError:
+            self.console.print(f"[red]Cannot read binary file: {escape(str(path))}[/red]")
+            return
+        except Exception as e:
+            self.console.print(f"[red]Read failed: {escape(str(e))}[/red]")
+            return
+
+        self.messages.append({
+            "role": "user",
+            "content": f"Contents of {path.name}:\n```\n{content}\n```",
+        })
+        line_count = content.count("\n") + 1
+        self.console.print(
+            f"[green]Loaded {path.name} ({line_count} lines) into context.[/green]"
+        )
+
+    def _run_shell_command(self, command: str):
+        if not command:
+            self.console.print("[red]Usage: /run <command>[/red]")
+            return
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.console.print("[red]Command timed out after 30s.[/red]")
+            return
+        except Exception as e:
+            self.console.print(f"[red]Command failed: {escape(str(e))}[/red]")
+            return
+
+        output = ((result.stdout or "") + (result.stderr or "")).strip() or "(no output)"
+        truncated = output[:4000]
+
+        self.console.print(
+            Panel(
+                escape(truncated),
+                title=escape(f"$ {command}"),
+                border_style="green" if result.returncode == 0 else "red",
+            )
+        )
+
+        self.messages.append({
+            "role": "user",
+            "content": (
+                f"Ran command `{command}` (exit code {result.returncode}):\n"
+                f"```\n{truncated}\n```"
+            ),
+        })
+
     def _handle_command(self, cmd: str) -> bool:
-        cmd = cmd.strip().lower()
+        raw_cmd = cmd.strip()
+        cmd = raw_cmd.lower()
 
         if cmd in ("/quit", "/q", "exit"):
             self.tracker.end_session()
@@ -715,7 +807,7 @@ class UniversalAICli:
             history_text = []
             for m in self.messages:
                 role_color = "green" if m["role"] == "user" else "cyan"
-                preview = str(m.get("content", ""))[:100]
+                preview = escape(str(m.get("content", ""))[:100])
                 history_text.append(
                     f"[{role_color}]{m['role'].upper()}[/]: {preview}..."
                 )
@@ -740,11 +832,12 @@ class UniversalAICli:
             try:
                 with open(self.history_file, "w", encoding="utf-8") as f:
                     json.dump(self.messages, f, ensure_ascii=False, indent=2)
+                os.chmod(self.history_file, 0o600)
                 self.console.print(
                     f"[green]History saved to {self.history_file}[/green]"
                 )
             except Exception as e:
-                self.console.print(f"[red]Save failed: {e}[/red]")
+                self.console.print(f"[red]Save failed: {escape(str(e))}[/red]")
             return True
 
         elif cmd == "/load":
@@ -757,21 +850,45 @@ class UniversalAICli:
             except FileNotFoundError:
                 self.console.print("[red]No saved history found.[/red]")
             except Exception as e:
-                self.console.print(f"[red]Load failed: {e}[/red]")
+                self.console.print(f"[red]Load failed: {escape(str(e))}[/red]")
             return True
 
         elif cmd.startswith("/model "):
-            new_model = cmd[7:].strip()
+            new_model = raw_cmd[7:].strip()
             if new_model:
                 self.config.model = new_model
+                self.model_explicit = True
                 self.tracker.current_session.model = new_model
                 self.console.print(f"[green]Model switched to: {new_model}[/green]")
+            return True
+
+        elif cmd.startswith("/model-arn"):
+            new_arn = raw_cmd[len("/model-arn"):].strip()
+            if not new_arn or new_arn.lower() == "clear":
+                self.model_arn = None
+                self.console.print("[green]Inference ARN cleared; using --model.[/green]")
+            else:
+                if not self.config.is_bedrock:
+                    self.console.print(
+                        "[yellow]Warning: /model-arn only applies to the Bedrock provider.[/yellow]"
+                    )
+                self.model_arn = new_arn
+                self.console.print(f"[green]Inference ARN set to: {escape(new_arn)}[/green]")
+            return True
+
+        elif cmd.startswith("/read "):
+            self._read_file_into_context(raw_cmd[6:].strip())
+            return True
+
+        elif cmd.startswith("/run "):
+            self._run_shell_command(raw_cmd[5:].strip())
             return True
 
         elif cmd.startswith("/"):
             self.console.print(
                 "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
-                "/history, /stats, /cost, /model <name>, /quit[/yellow]"
+                "/history, /stats, /cost, /model <name>, /model-arn <arn|clear>, "
+                "/read <path>, /run <cmd>, /quit[/yellow]"
             )
             return True
 
@@ -823,6 +940,13 @@ def main():
         help="API provider (default: custom)",
     )
     parser.add_argument("--model", help="Override default model")
+    parser.add_argument(
+        "--model-arn",
+        help=(
+            "Bedrock inference profile / application inference profile ARN to "
+            "invoke instead of --model (--model is still used for pricing/display)"
+        ),
+    )
     parser.add_argument("--base-url", help="Override API base URL")
     parser.add_argument("--api-key", help="API key")
     parser.add_argument(
@@ -878,6 +1002,7 @@ def main():
             reasoning=args.reasoning,
             region=args.region,
             profile=args.profile,
+            model_arn=args.model_arn,
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -886,7 +1011,7 @@ def main():
     if args.single:
         cli._set_system_prompt(args.system)
         cli._print_banner()
-        cli.console.print(f"[bold green]You[/bold green]: {args.single}")
+        cli.console.print(f"[bold green]You[/bold green]: {escape(args.single)}")
         cli.console.print(f"[bold cyan]{cli.config.model}[/bold cyan]: ", end="")
         if args.no_stream:
             cli._non_stream_chat(args.single)
