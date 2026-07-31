@@ -28,6 +28,63 @@ from rich.markup import escape
 
 
 # =============================================================================
+# CONTEXT WINDOW DATABASE (max tokens per model)
+# =============================================================================
+
+CONTEXT_WINDOWS = {
+    # --- Moonshot / Kimi ---
+    "kimi-k3": 200_000,
+    "kimi-k2-thinking": 200_000,
+    "kimi-k2.5": 200_000,
+    "kimi-k2.6": 200_000,
+    "kimi-k2.7-code": 200_000,
+
+    # --- OpenAI ---
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4-turbo": 128_000,
+    "o1": 128_000,
+    "o1-preview": 128_000,
+    "o3-mini": 200_000,
+
+    # --- DeepSeek ---
+    "deepseek-chat": 64_000,
+    "deepseek-reasoner": 64_000,
+
+    # --- Groq ---
+    "llama-3.3-70b-versatile": 8_192,
+    "llama-3.1-8b-instant": 8_192,
+    "mixtral-8x7b-32768": 32_768,
+
+    # --- AWS Bedrock (Claude) ---
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": 200_000,
+    "anthropic.claude-3-haiku-20240307-v1:0": 200_000,
+    "anthropic.claude-3-opus-20240229-v1:0": 200_000,
+
+    # --- AWS Bedrock (Llama) ---
+    "meta.llama3-70b-instruct-v1:0": 8_192,
+    "meta.llama3-8b-instruct-v1:0": 8_192,
+
+    # --- AWS Bedrock (Mistral) ---
+    "mistral.mistral-large-2402-v1:0": 32_768,
+
+    # --- AWS Bedrock (Amazon Titan) ---
+    "amazon.titan-text-express-v1": 8_000,
+    "amazon.titan-text-lite-v1": 4_000,
+
+    # --- Qwen ---
+    "qwen-max": 32_768,
+    "qwen-plus": 32_768,
+    "qwen-turbo": 8_192,
+
+    # --- Ollama (Local) ---
+    "llama3.2": 8_192,
+    "llama3.1": 8_192,
+    "mistral": 8_192,
+}
+
+
+# =============================================================================
 # PRICING DATABASE (USD per 1M tokens)
 # =============================================================================
 
@@ -101,6 +158,29 @@ def get_pricing(model_id: str) -> dict:
     return {"input": 0.0, "output": 0.0, "provider": "unknown"}
 
 
+def get_context_window(model_id: str) -> int:
+    """Get context window size for a model. Defaults to 8192 if unknown."""
+    if not model_id:
+        return 8_192
+
+    # Exact match
+    if model_id in CONTEXT_WINDOWS:
+        return CONTEXT_WINDOWS[model_id]
+
+    # Partial match (for Bedrock full ARNs or versioned IDs)
+    for key, window in CONTEXT_WINDOWS.items():
+        if key in model_id or model_id in key:
+            return window
+
+    # Default context window
+    return 8_192
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token (simplified)."""
+    return len(text) // 4
+
+
 # =============================================================================
 # USAGE TRACKER
 # =============================================================================
@@ -119,6 +199,69 @@ class SessionUsage:
     cost_total: float = 0.0
     start_time: str = field(default_factory=lambda: datetime.now().isoformat())
     end_time: Optional[str] = None
+
+
+class ContextWindowManager:
+    """Manages conversation context to stay within model's token limit."""
+
+    def __init__(self, model: str, reserve_percent: float = 0.15):
+        self.model = model
+        self.context_limit = get_context_window(model)
+        self.reserve_tokens = int(self.context_limit * reserve_percent)
+        self.usable_tokens = self.context_limit - self.reserve_tokens
+
+    def estimate_messages_tokens(self, messages: list[dict]) -> int:
+        """Estimate total tokens used by messages."""
+        total = 0
+        for msg in messages:
+            # Add overhead for role and formatting (~5 tokens per message)
+            total += estimate_tokens(msg.get("content", "")) + 5
+        return total
+
+    def should_prune(self, messages: list[dict]) -> bool:
+        """Check if messages exceed usable context."""
+        return self.estimate_messages_tokens(messages) > self.usable_tokens
+
+    def get_token_usage_percent(self, messages: list[dict]) -> float:
+        """Get current token usage as a percentage of usable context."""
+        used = self.estimate_messages_tokens(messages)
+        return (used / self.usable_tokens) * 100 if self.usable_tokens > 0 else 0
+
+    def prune_messages(self, messages: list[dict], keep_system: bool = True) -> list[dict]:
+        """Prune old messages to fit within context, keeping system and latest."""
+        if not messages or not self.should_prune(messages):
+            return messages
+
+        pruned = []
+
+        # Keep system message if present
+        if keep_system and messages and messages[0].get("role") == "system":
+            pruned.append(messages[0])
+
+        # Keep the most recent N messages until we fit
+        kept_messages = []
+        for msg in reversed(messages[1:] if pruned else messages):
+            test_list = pruned + [msg] + kept_messages
+            if self.estimate_messages_tokens(test_list) <= self.usable_tokens:
+                kept_messages.insert(0, msg)
+            else:
+                break
+
+        return pruned + kept_messages
+
+    def get_status(self, messages: list[dict]) -> dict:
+        """Get context usage status."""
+        used_tokens = self.estimate_messages_tokens(messages)
+        usage_percent = self.get_token_usage_percent(messages)
+        return {
+            "context_limit": self.context_limit,
+            "reserve_tokens": self.reserve_tokens,
+            "usable_tokens": self.usable_tokens,
+            "used_tokens": used_tokens,
+            "remaining_tokens": max(0, self.usable_tokens - used_tokens),
+            "usage_percent": usage_percent,
+            "needs_pruning": self.should_prune(messages),
+        }
 
 
 class UsageTracker:
@@ -392,6 +535,9 @@ class UniversalAICli:
         self.messages: list[dict] = []
         self.history_file = os.path.expanduser(f"~/.ai_cli_{provider}_history")
 
+        # Context window management
+        self.context_manager = ContextWindowManager(self.config.model)
+
         # Token & cost tracking
         self.tracker = UsageTracker()
         self.tracker.start_session(provider, self.config.model)
@@ -484,7 +630,7 @@ class UniversalAICli:
             f"[dim]Model: {escape(display_model)}[/dim]\n"
             f"{arn_line}"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /model, /model-arn <arn>, /read <path>, /run <cmd>, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -508,6 +654,20 @@ class UniversalAICli:
 
     def _stream_chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
+
+        # Check context usage and warn/prune if needed
+        status = self.context_manager.get_status(self.messages)
+        if status["usage_percent"] > 80:
+            self.console.print(
+                f"[yellow]⚠️ Context usage at {status['usage_percent']:.0f}%. "
+                f"Remaining: {status['remaining_tokens']:,} tokens[/yellow]"
+            )
+        if status["needs_pruning"]:
+            pruned_count = len(self.messages) - len(self.context_manager.prune_messages(self.messages))
+            self.messages = self.context_manager.prune_messages(self.messages)
+            self.console.print(
+                f"[yellow]📌 Pruned {pruned_count} old messages to fit context window.[/yellow]"
+            )
 
         try:
             if self.config.is_bedrock:
@@ -635,6 +795,20 @@ class UniversalAICli:
 
     def _non_stream_chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
+
+        # Check context usage and warn/prune if needed
+        status = self.context_manager.get_status(self.messages)
+        if status["usage_percent"] > 80:
+            self.console.print(
+                f"[yellow]⚠️ Context usage at {status['usage_percent']:.0f}%. "
+                f"Remaining: {status['remaining_tokens']:,} tokens[/yellow]"
+            )
+        if status["needs_pruning"]:
+            pruned_count = len(self.messages) - len(self.context_manager.prune_messages(self.messages))
+            self.messages = self.context_manager.prune_messages(self.messages)
+            self.console.print(
+                f"[yellow]📌 Pruned {pruned_count} old messages to fit context window.[/yellow]"
+            )
 
         try:
             if self.config.is_bedrock:
@@ -828,6 +1002,27 @@ class UniversalAICli:
             self.tracker.display_session_summary(self.console)
             return True
 
+        elif cmd == "/context":
+            status = self.context_manager.get_status(self.messages)
+            table = Table(box=box.SIMPLE, border_style="blue", show_header=False)
+            table.add_column("", style="dim")
+            table.add_column("", justify="right")
+
+            table.add_row("Model", self.config.model)
+            table.add_row("Context Limit", f"{status['context_limit']:,} tokens")
+            table.add_row("Reserve", f"{status['reserve_tokens']:,} tokens (15%)")
+            table.add_row("Usable", f"{status['usable_tokens']:,} tokens")
+            table.add_row("Used", f"{status['used_tokens']:,} tokens")
+            table.add_row("Remaining", f"{status['remaining_tokens']:,} tokens")
+            table.add_row("Usage", f"{status['usage_percent']:.1f}%")
+            table.add_row("Messages", str(len(self.messages)))
+
+            border_color = "red" if status["needs_pruning"] else ("yellow" if status["usage_percent"] > 80 else "green")
+            self.console.print(
+                Panel(table, title="📊 Context Window Status", border_style=border_color, expand=False)
+            )
+            return True
+
         elif cmd == "/save":
             try:
                 with open(self.history_file, "w", encoding="utf-8") as f:
@@ -858,6 +1053,7 @@ class UniversalAICli:
             if new_model:
                 self.config.model = new_model
                 self.model_explicit = True
+                self.context_manager = ContextWindowManager(new_model)
                 self.tracker.current_session.model = new_model
                 self.console.print(f"[green]Model switched to: {new_model}[/green]")
             return True
@@ -887,7 +1083,7 @@ class UniversalAICli:
         elif cmd.startswith("/"):
             self.console.print(
                 "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
-                "/history, /stats, /cost, /model <name>, /model-arn <arn|clear>, "
+                "/history, /stats, /cost, /context, /model <name>, /model-arn <arn|clear>, "
                 "/read <path>, /run <cmd>, /quit[/yellow]"
             )
             return True
