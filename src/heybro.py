@@ -6,17 +6,31 @@ Tracks usage and persists to local JSON file.
 """
 
 import os
+import re
 import sys
 import json
 import atexit
+import asyncio
+import shlex
 import argparse
+import threading
 import subprocess
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import readline
 except ImportError:  # not available on some platforms (e.g. Windows)
     readline = None
+
+try:
+    from contextlib import AsyncExitStack
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    MCP_AVAILABLE = True
+except ImportError:  # 'mcp' package not installed
+    MCP_AVAILABLE = False
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -185,6 +199,220 @@ def get_context_window(model_id: str) -> int:
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars per token (simplified)."""
     return len(text) // 4
+
+
+MAX_TOOL_ROUNDS = 8
+
+
+def _sanitize_tool_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+
+
+# =============================================================================
+# MCP (MODEL CONTEXT PROTOCOL) SERVER REGISTRY
+# =============================================================================
+
+class MCPManager:
+    """Registers stdio MCP servers and exposes their tools for function-calling.
+
+    The MCP client SDK is async-only; the rest of this CLI is synchronous, so
+    every registered server is connected on a single dedicated background
+    event-loop thread and all calls are bridged onto it with
+    run_coroutine_threadsafe.
+    """
+
+    def __init__(self, config_file: str, console: Console):
+        self.config_file = config_file
+        self.console = console
+        self.servers: dict[str, dict] = self._load_config()
+
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stacks: dict[str, "AsyncExitStack"] = {}
+        self.sessions: dict[str, "ClientSession"] = {}
+        # prefixed tool name -> (server name, original tool name, input schema)
+        self.tools: dict[str, tuple[str, str, dict]] = {}
+        self.tool_descriptions: dict[str, str] = {}
+        self.errors: dict[str, str] = {}
+
+        if MCP_AVAILABLE and self.servers:
+            for name, cfg in list(self.servers.items()):
+                self._connect_one(name, cfg)
+
+    # ---- config persistence ----
+
+    def _load_config(self) -> dict:
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return {}
+        return {}
+
+    def _save_config(self):
+        with open(self.config_file, "w", encoding="utf-8") as f:
+            json.dump(self.servers, f, indent=2, ensure_ascii=False)
+        os.chmod(self.config_file, 0o600)
+
+    # ---- background event loop bridging ----
+
+    def _ensure_loop(self):
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+            self._thread.start()
+
+    def _run(self, coro, timeout: float = 30):
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    # ---- server lifecycle ----
+
+    def add_server(self, name: str, command: str, args: list[str], env: Optional[dict] = None):
+        if name in self.servers:
+            self._disconnect_one(name)
+        self.servers[name] = {"command": command, "args": args, "env": env or {}}
+        self._save_config()
+        if MCP_AVAILABLE:
+            self._connect_one(name, self.servers[name])
+
+    def remove_server(self, name: str) -> bool:
+        if name not in self.servers:
+            return False
+        del self.servers[name]
+        self._save_config()
+        self._disconnect_one(name)
+        return True
+
+    def _connect_one(self, name: str, cfg: dict):
+        self._ensure_loop()
+        stack = AsyncExitStack()
+
+        async def _connect():
+            params = StdioServerParameters(
+                command=cfg["command"], args=cfg.get("args", []), env=cfg.get("env") or None,
+            )
+            read, write = await stack.enter_async_context(stdio_client(params))
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            result = await session.list_tools()
+            return session, result.tools
+
+        try:
+            session, tools = self._run(_connect())
+        except Exception as e:
+            self.errors[name] = str(e)
+            self.console.print(f"[red]MCP server '{name}' failed to connect: {escape(str(e))}[/red]")
+            return
+
+        self.errors.pop(name, None)
+        self._stacks[name] = stack
+        self.sessions[name] = session
+        for tool in tools:
+            prefixed = f"{_sanitize_tool_name(name)}__{_sanitize_tool_name(tool.name)}"[:64]
+            schema = tool.input_schema or {"type": "object", "properties": {}}
+            self.tools[prefixed] = (name, tool.name, schema)
+            self.tool_descriptions[prefixed] = tool.description or ""
+        self.console.print(f"[green]MCP server '{name}' connected ({len(tools)} tools).[/green]")
+
+    def _disconnect_one(self, name: str):
+        self.sessions.pop(name, None)
+        for prefixed in [p for p, (s, _, _) in self.tools.items() if s == name]:
+            del self.tools[prefixed]
+            self.tool_descriptions.pop(prefixed, None)
+        stack = self._stacks.pop(name, None)
+        if stack is not None and self._loop is not None:
+            try:
+                self._run(stack.aclose(), timeout=10)
+            except Exception:
+                pass
+
+    def shutdown(self):
+        if self._loop is None:
+            return
+        for name in list(self._stacks):
+            self._disconnect_one(name)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    # ---- tool schemas & invocation ----
+
+    def get_tool_schemas(self) -> list[dict]:
+        """OpenAI-style function-calling tool definitions."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": prefixed,
+                    "description": self.tool_descriptions.get(prefixed, ""),
+                    "parameters": schema,
+                },
+            }
+            for prefixed, (_, _, schema) in self.tools.items()
+        ]
+
+    def get_bedrock_tool_config(self) -> Optional[dict]:
+        """Bedrock Converse API toolConfig, or None if no tools are registered."""
+        if not self.tools:
+            return None
+        return {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": prefixed,
+                        "description": self.tool_descriptions.get(prefixed, ""),
+                        "inputSchema": {"json": schema},
+                    }
+                }
+                for prefixed, (_, _, schema) in self.tools.items()
+            ]
+        }
+
+    def call_tool(self, prefixed_name: str, arguments: dict) -> str:
+        if prefixed_name not in self.tools:
+            return f"Error: unknown tool '{prefixed_name}'."
+        server, tool_name, _ = self.tools[prefixed_name]
+        session = self.sessions.get(server)
+        if session is None:
+            return f"Error: MCP server '{server}' is not connected."
+
+        result = self._run(session.call_tool(tool_name, arguments), timeout=60)
+        parts = [getattr(block, "text", "") for block in result.content]
+        text_out = "\n".join(p for p in parts if p) or "(tool returned no text content)"
+        return f"Tool error: {text_out}" if result.is_error else text_out
+
+    # ---- display helpers ----
+
+    def status_table(self) -> Table:
+        table = Table(box=box.SIMPLE, border_style="blue")
+        table.add_column("Server")
+        table.add_column("Command")
+        table.add_column("Status")
+        table.add_column("Tools", justify="right")
+        for name, cfg in self.servers.items():
+            cmd_display = " ".join([cfg["command"], *cfg.get("args", [])])
+            if name in self.sessions:
+                status = "[green]connected[/green]"
+            elif name in self.errors:
+                status = f"[red]error: {escape(self.errors[name])}[/red]"
+            else:
+                status = "[yellow]not connected[/yellow]"
+            tool_count = sum(1 for s, _, _ in self.tools.values() if s == name)
+            table.add_row(escape(name), escape(cmd_display), status, str(tool_count))
+        return table
+
+    def tools_table(self) -> Table:
+        table = Table(box=box.SIMPLE, border_style="magenta")
+        table.add_column("Tool")
+        table.add_column("Server")
+        table.add_column("Description")
+        for prefixed, (server, _, _) in sorted(self.tools.items()):
+            table.add_row(
+                escape(prefixed), escape(server), escape(self.tool_descriptions.get(prefixed, "")[:80])
+            )
+        return table
 
 
 # =============================================================================
@@ -550,6 +778,11 @@ class UniversalAICli:
         self.tracker = UsageTracker()
         self.tracker.start_session(provider, self.config.model)
 
+        # MCP server registry (tool-calling)
+        self.mcp_config_file = os.path.expanduser(f"~/.ai_cli_{provider}_mcp_servers.json")
+        self.mcp = MCPManager(self.mcp_config_file, self.console)
+        atexit.register(self.mcp.shutdown)
+
         # Initialize client
         if self.config.is_bedrock:
             self._init_bedrock()
@@ -612,7 +845,29 @@ class UniversalAICli:
             and self.config.reasoning_param
         ):
             payload[self.config.reasoning_param] = self.reasoning
+        tools = self.mcp.get_tool_schemas()
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         return payload
+
+    def _execute_tool_call(self, name: str, arguments, is_json_str: bool = True) -> str:
+        """Run one tool call through the MCP registry and print a status line."""
+        if is_json_str:
+            try:
+                args = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = arguments or {}
+
+        preview = json.dumps(args, ensure_ascii=False)[:200]
+        self.console.print(f"[magenta]🔧 {escape(name)}({escape(preview)})[/magenta]")
+
+        try:
+            return self.mcp.call_tool(name, args)
+        except Exception as e:
+            return f"Error calling tool {name}: {e}"
 
     def _extract_content(self, delta_or_message) -> tuple[str, Optional[str]]:
         content = getattr(delta_or_message, "content", "") or ""
@@ -657,7 +912,7 @@ class UniversalAICli:
             f"[dim]Model: {escape(display_model)}[/dim]\n"
             f"{arn_line}"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -707,69 +962,108 @@ class UniversalAICli:
             return ""
 
     def _openai_stream_chat(self, user_input: str) -> str:
-        request = self._build_request(self.messages, stream=True)
-        # Request usage in stream
-        request["stream_options"] = {"include_usage": True}
+        working = list(self.messages)
+        total_input_tokens = 0
+        total_output_tokens = 0
+        final_content = ""
 
-        response = self.client.chat.completions.create(**request)
+        for round_num in range(MAX_TOOL_ROUNDS):
+            request = self._build_request(working, stream=True)
+            # Request usage in stream
+            request["stream_options"] = {"include_usage": True}
 
-        full_content = ""
-        reasoning_content = ""
-        input_tokens = 0
-        output_tokens = 0
+            response = self.client.chat.completions.create(**request)
 
-        def render():
-            parts = []
-            if reasoning_content:
-                parts.append(
-                    Panel(
-                        Markdown(reasoning_content),
-                        title="[yellow]Reasoning Process[/yellow]",
-                        border_style="yellow",
-                        expand=False,
+            full_content = ""
+            reasoning_content = ""
+            input_tokens = 0
+            output_tokens = 0
+            tool_calls_acc: dict[int, dict] = {}
+
+            def render():
+                parts = []
+                if reasoning_content:
+                    parts.append(
+                        Panel(
+                            Markdown(reasoning_content),
+                            title="[yellow]Reasoning Process[/yellow]",
+                            border_style="yellow",
+                            expand=False,
+                        )
                     )
-                )
-            if full_content:
-                parts.append(Markdown(full_content))
-            return Group(*parts)
-        waiting = Spinner("dots", text=" Waiting for response...")
-        with Live(waiting, console=self.console, refresh_per_second=15) as live:
-            for chunk in response:
-                # Capture usage from final chunk
-                if hasattr(chunk, "usage") and chunk.usage:
-                    input_tokens = getattr(chunk.usage, "prompt_tokens", 0)
-                    output_tokens = getattr(chunk.usage, "completion_tokens", 0)
+                if full_content:
+                    parts.append(Markdown(full_content))
+                return Group(*parts)
+            waiting = Spinner("dots", text=" Waiting for response...")
+            with Live(waiting, console=self.console, refresh_per_second=15) as live:
+                for chunk in response:
+                    # Capture usage from final chunk
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        input_tokens = getattr(chunk.usage, "prompt_tokens", 0)
+                        output_tokens = getattr(chunk.usage, "completion_tokens", 0)
 
-                if not chunk.choices:
-                    continue
+                    if not chunk.choices:
+                        continue
 
-                delta = chunk.choices[0].delta
-                content, reasoning = self._extract_content(delta)
+                    delta = chunk.choices[0].delta
+                    content, reasoning = self._extract_content(delta)
 
-                if reasoning:
-                    reasoning_content += reasoning
-                    live.update(render())
+                    if reasoning:
+                        reasoning_content += reasoning
+                        live.update(render())
 
-                if content:
-                    full_content += content
-                    live.update(render())
+                    if content:
+                        full_content += content
+                        live.update(render())
 
-        self.console.print()
+                    for tc in getattr(delta, "tool_calls", None) or []:
+                        entry = tool_calls_acc.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
+                        if tc.id:
+                            entry["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                entry["name"] += tc.function.name
+                            if tc.function.arguments:
+                                entry["arguments"] += tc.function.arguments
 
-        self.messages.append({"role": "assistant", "content": full_content})
+            self.console.print()
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+
+            if tool_calls_acc:
+                ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+                working.append({
+                    "role": "assistant",
+                    "content": full_content,
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                        }
+                        for tc in ordered
+                    ],
+                })
+                for tc in ordered:
+                    result_text = self._execute_tool_call(tc["name"], tc["arguments"])
+                    working.append({"role": "tool", "tool_call_id": tc["id"], "content": result_text})
+                continue
+
+            final_content = full_content
+            break
+        else:
+            final_content = "[MCP tool-call loop exceeded max rounds]"
+
+        self.messages.append({"role": "assistant", "content": final_content})
 
         # Record usage
-        if input_tokens or output_tokens:
-            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+        if total_input_tokens or total_output_tokens:
+            self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
             # self.tracker.display_session_summary(self.console)
 
-        return full_content
+        return final_content
 
-    def _bedrock_stream_chat(self, user_input: str) -> str:
-        """Stream chat using Bedrock ConverseStream API."""
-        import boto3
-
-        # Convert messages to Bedrock format
+    def _bedrock_msgs_from_history(self) -> tuple[list, Optional[str]]:
         bedrock_msgs = []
         system_text = None
         for msg in self.messages:
@@ -781,44 +1075,105 @@ class UniversalAICli:
                 "role": bedrock_role,
                 "content": [{"text": msg["content"]}],
             })
+        return bedrock_msgs, system_text
 
-        kwargs = {
-            "modelId": self.model_arn or self.config.model,
-            "messages": bedrock_msgs,
-        }
-        if system_text:
-            kwargs["system"] = [{"text": system_text}]
+    def _bedrock_stream_chat(self, user_input: str) -> str:
+        """Stream chat using Bedrock ConverseStream API."""
+        bedrock_msgs, system_text = self._bedrock_msgs_from_history()
+        tool_config = self.mcp.get_bedrock_tool_config()
+        total_input_tokens = 0
+        total_output_tokens = 0
+        final_content = ""
 
-        response = self.bedrock_client.converse_stream(**kwargs)
-        stream = response.get("stream")
+        for round_num in range(MAX_TOOL_ROUNDS):
+            kwargs = {
+                "modelId": self.model_arn or self.config.model,
+                "messages": bedrock_msgs,
+            }
+            if system_text:
+                kwargs["system"] = [{"text": system_text}]
+            if tool_config:
+                kwargs["toolConfig"] = tool_config
 
-        full_content = ""
-        input_tokens = 0
-        output_tokens = 0
-        waiting = Spinner("dots", text=" Waiting for response...")
-        with Live(waiting, console=self.console, refresh_per_second=15) as live:
-            for event in stream:
-                if "contentBlockDelta" in event:
-                    delta = event["contentBlockDelta"]["delta"]
-                    if "text" in delta:
-                        full_content += delta["text"]
-                        live.update(Markdown(full_content))
+            response = self.bedrock_client.converse_stream(**kwargs)
+            stream = response.get("stream")
 
-                # Capture usage from metadata event
-                if "metadata" in event:
-                    usage = event["metadata"].get("usage", {})
-                    input_tokens = usage.get("inputTokens", 0)
-                    output_tokens = usage.get("outputTokens", 0)
+            full_content = ""
+            input_tokens = 0
+            output_tokens = 0
+            stop_reason = None
+            blocks: dict[int, dict] = {}
+            waiting = Spinner("dots", text=" Waiting for response...")
+            with Live(waiting, console=self.console, refresh_per_second=15) as live:
+                for event in stream:
+                    if "contentBlockStart" in event:
+                        idx = event["contentBlockStart"]["contentBlockIndex"]
+                        start = event["contentBlockStart"].get("start", {})
+                        if "toolUse" in start:
+                            blocks[idx] = {
+                                "toolUseId": start["toolUse"]["toolUseId"],
+                                "name": start["toolUse"]["name"],
+                                "input_json": "",
+                            }
 
-        self.console.print()
+                    if "contentBlockDelta" in event:
+                        idx = event["contentBlockDelta"]["contentBlockIndex"]
+                        delta = event["contentBlockDelta"]["delta"]
+                        if "text" in delta:
+                            full_content += delta["text"]
+                            live.update(Markdown(full_content))
+                        elif "toolUse" in delta:
+                            entry = blocks.setdefault(idx, {"input_json": ""})
+                            entry["input_json"] += delta["toolUse"].get("input", "")
 
-        self.messages.append({"role": "assistant", "content": full_content})
+                    if "messageStop" in event:
+                        stop_reason = event["messageStop"].get("stopReason")
 
-        if input_tokens or output_tokens:
-            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+                    # Capture usage from metadata event
+                    if "metadata" in event:
+                        usage = event["metadata"].get("usage", {})
+                        input_tokens = usage.get("inputTokens", 0)
+                        output_tokens = usage.get("outputTokens", 0)
+
+            self.console.print()
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+
+            tool_blocks = [b for b in blocks.values() if "toolUseId" in b]
+            if stop_reason == "tool_use" and tool_blocks:
+                for b in tool_blocks:
+                    try:
+                        b["input"] = json.loads(b["input_json"]) if b["input_json"] else {}
+                    except json.JSONDecodeError:
+                        b["input"] = {}
+
+                assistant_content = ([{"text": full_content}] if full_content else []) + [
+                    {"toolUse": {"toolUseId": b["toolUseId"], "name": b["name"], "input": b["input"]}}
+                    for b in tool_blocks
+                ]
+                bedrock_msgs.append({"role": "assistant", "content": assistant_content})
+
+                result_content = []
+                for b in tool_blocks:
+                    result_text = self._execute_tool_call(b["name"], b["input"], is_json_str=False)
+                    result_content.append({
+                        "toolResult": {"toolUseId": b["toolUseId"], "content": [{"text": result_text}]}
+                    })
+                bedrock_msgs.append({"role": "user", "content": result_content})
+                continue
+
+            final_content = full_content
+            break
+        else:
+            final_content = "[MCP tool-call loop exceeded max rounds]"
+
+        self.messages.append({"role": "assistant", "content": final_content})
+
+        if total_input_tokens or total_output_tokens:
+            self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
             # self.tracker.display_session_summary(self.console)
 
-        return full_content
+        return final_content
 
     def _non_stream_chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
@@ -848,73 +1203,121 @@ class UniversalAICli:
             return ""
 
     def _openai_non_stream_chat(self, user_input: str) -> str:
-        request = self._build_request(self.messages, stream=False)
-        response = self.client.chat.completions.create(**request)
+        working = list(self.messages)
+        total_input_tokens = 0
+        total_output_tokens = 0
+        final_content = ""
 
-        message = response.choices[0].message
-        content, reasoning = self._extract_content(message)
+        for round_num in range(MAX_TOOL_ROUNDS):
+            request = self._build_request(working, stream=False)
+            response = self.client.chat.completions.create(**request)
 
-        if reasoning:
-            self.console.print(
-                Panel(
-                    Markdown(reasoning),
-                    title="[yellow]Reasoning Process[/yellow]",
-                    border_style="yellow",
-                    expand=False,
+            message = response.choices[0].message
+            input_tokens, output_tokens = self._extract_usage(response)
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+
+            tool_calls = getattr(message, "tool_calls", None)
+            if tool_calls:
+                working.append({
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in tool_calls
+                    ],
+                })
+                for tc in tool_calls:
+                    result_text = self._execute_tool_call(tc.function.name, tc.function.arguments)
+                    working.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+                continue
+
+            content, reasoning = self._extract_content(message)
+
+            if reasoning:
+                self.console.print(
+                    Panel(
+                        Markdown(reasoning),
+                        title="[yellow]Reasoning Process[/yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    )
                 )
-            )
 
-        self.console.print(Markdown(content))
-        self.console.print()
+            self.console.print(Markdown(content))
+            self.console.print()
+            final_content = content
+            break
+        else:
+            final_content = "[MCP tool-call loop exceeded max rounds]"
 
-        self.messages.append({"role": "assistant", "content": content})
+        self.messages.append({"role": "assistant", "content": final_content})
 
         # Record usage
-        input_tokens, output_tokens = self._extract_usage(response)
-        if input_tokens or output_tokens:
-            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+        if total_input_tokens or total_output_tokens:
+            self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
             # self.tracker.display_session_summary(self.console)
 
-        return content
+        return final_content
 
     def _bedrock_non_stream_chat(self, user_input: str) -> str:
         """Non-stream chat using Bedrock Converse API."""
-        bedrock_msgs = []
-        system_text = None
-        for msg in self.messages:
-            if msg["role"] == "system":
-                system_text = msg["content"]
+        bedrock_msgs, system_text = self._bedrock_msgs_from_history()
+        tool_config = self.mcp.get_bedrock_tool_config()
+        total_input_tokens = 0
+        total_output_tokens = 0
+        final_text = ""
+
+        for round_num in range(MAX_TOOL_ROUNDS):
+            kwargs = {
+                "modelId": self.model_arn or self.config.model,
+                "messages": bedrock_msgs,
+            }
+            if system_text:
+                kwargs["system"] = [{"text": system_text}]
+            if tool_config:
+                kwargs["toolConfig"] = tool_config
+
+            response = self.bedrock_client.converse(**kwargs)
+
+            usage = response.get("usage", {})
+            total_input_tokens += usage.get("inputTokens", 0)
+            total_output_tokens += usage.get("outputTokens", 0)
+
+            output_message = response["output"]["message"]
+            content_blocks = output_message["content"]
+            tool_uses = [b["toolUse"] for b in content_blocks if "toolUse" in b]
+
+            if response.get("stopReason") == "tool_use" and tool_uses:
+                bedrock_msgs.append(output_message)
+                result_content = []
+                for tu in tool_uses:
+                    result_text = self._execute_tool_call(tu["name"], tu.get("input", {}), is_json_str=False)
+                    result_content.append({
+                        "toolResult": {"toolUseId": tu["toolUseId"], "content": [{"text": result_text}]}
+                    })
+                bedrock_msgs.append({"role": "user", "content": result_content})
                 continue
-            bedrock_role = "user" if msg["role"] == "user" else "assistant"
-            bedrock_msgs.append({
-                "role": bedrock_role,
-                "content": [{"text": msg["content"]}],
-            })
 
-        kwargs = {
-            "modelId": self.model_arn or self.config.model,
-            "messages": bedrock_msgs,
-        }
-        if system_text:
-            kwargs["system"] = [{"text": system_text}]
+            final_text = "\n".join(b["text"] for b in content_blocks if "text" in b)
+            self.console.print(Markdown(final_text))
+            self.console.print()
+            break
+        else:
+            final_text = "[MCP tool-call loop exceeded max rounds]"
 
-        response = self.bedrock_client.converse(**kwargs)
-
-        output = response["output"]["message"]["content"][0]["text"]
-        self.console.print(Markdown(output))
-        self.console.print()
-
-        self.messages.append({"role": "assistant", "content": output})
+        self.messages.append({"role": "assistant", "content": final_text})
 
         # Record usage
-        usage = response.get("usage", {})
-        input_tokens = usage.get("inputTokens", 0)
-        output_tokens = usage.get("outputTokens", 0)
-        if input_tokens or output_tokens:
-            self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
+        if total_input_tokens or total_output_tokens:
+            self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
             # self.tracker.display_session_summary(self.console)
 
-        return output
+        return final_text
 
     def _read_file_into_context(self, file_path: str):
         if not file_path:
@@ -950,16 +1353,10 @@ class UniversalAICli:
             self.console.print("[red]Usage: /run <command>[/red]")
             return
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            self.console.print("[red]Command timed out after 30s.[/red]")
-            return
+            result = subprocess.run(shlex.split(command), capture_output=True, text=True, check=True)
+            self.console.print(f"[green]Command output:[/green]\n{result.stdout}")
+        except subprocess.CalledProcessError as e:
+            self.console.print(f"[red]Command failed with error code {e.returncode}:[/red]\n{e.stderr}")
         except Exception as e:
             self.console.print(f"[red]Command failed: {escape(str(e))}[/red]")
             return
@@ -982,6 +1379,59 @@ class UniversalAICli:
                 f"```\n{truncated}\n```"
             ),
         })
+
+    def _handle_mcp_command(self, args_str: str):
+        if not MCP_AVAILABLE:
+            self.console.print(
+                "[red]MCP support requires the 'mcp' package: pip install mcp[/red]"
+            )
+            return
+
+        parts = args_str.split(maxsplit=1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if sub == "add":
+            try:
+                tokens = shlex.split(rest)
+            except ValueError as e:
+                self.console.print(f"[red]Invalid syntax: {escape(str(e))}[/red]")
+                return
+            if len(tokens) < 2:
+                self.console.print("[red]Usage: /mcp add <name> <command> [args...][/red]")
+                return
+            name, command, *cmd_args = tokens
+            if name in self.mcp.servers:
+                self.console.print(f"[yellow]Server '{name}' already registered; reconnecting.[/yellow]")
+            self.mcp.add_server(name, command, cmd_args)
+
+        elif sub == "remove":
+            name = rest.strip()
+            if not name:
+                self.console.print("[red]Usage: /mcp remove <name>[/red]")
+                return
+            if self.mcp.remove_server(name):
+                self.console.print(f"[green]Removed MCP server '{escape(name)}'.[/green]")
+            else:
+                self.console.print(f"[red]No such server: {escape(name)}[/red]")
+
+        elif sub in ("list", ""):
+            if not self.mcp.servers:
+                self.console.print("[yellow]No MCP servers registered. Try: /mcp add <name> <command> [args...][/yellow]")
+                return
+            self.console.print(Panel(self.mcp.status_table(), title="MCP Servers", border_style="blue"))
+
+        elif sub == "tools":
+            if not self.mcp.tools:
+                self.console.print("[yellow]No MCP tools available.[/yellow]")
+                return
+            self.console.print(Panel(self.mcp.tools_table(), title="MCP Tools", border_style="magenta"))
+
+        else:
+            self.console.print(
+                "[yellow]Usage: /mcp add <name> <command> [args...] | /mcp remove <name> | "
+                "/mcp list | /mcp tools[/yellow]"
+            )
 
     def _handle_command(self, cmd: str) -> bool:
         raw_cmd = cmd.strip()
@@ -1107,11 +1557,15 @@ class UniversalAICli:
             self._run_shell_command(raw_cmd[5:].strip())
             return True
 
+        elif cmd == "/mcp" or cmd.startswith("/mcp "):
+            self._handle_mcp_command(raw_cmd[4:].strip())
+            return True
+
         elif cmd.startswith("/"):
             self.console.print(
                 "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
                 "/history, /stats, /cost, /context, /model <name>, /model-arn <arn|clear>, "
-                "/read <path>, /run <cmd>, /quit[/yellow]"
+                "/read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/yellow]"
             )
             return True
 

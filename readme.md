@@ -1,5 +1,6 @@
 Install dependencies
 pip install openai rich boto3
+pip install mcp   # optional, needed for /mcp (Model Context Protocol tool servers)
 
 --- Moonshot (Kimi K3) ---
 export MOONSHOT_API_KEY="your-key"
@@ -16,6 +17,26 @@ export AWS_ACCESS_KEY_ID="your-key"
 
   --- View all-time stats ---
  > /stats
+
+  --- Register an MCP tool server (stdio) ---
+ > /mcp add fs npx -y @modelcontextprotocol/server-filesystem /path/to/allow
+ > /mcp list
+ > /mcp tools
+ > /mcp remove fs
+
+ > /mcp add fs npx -y @modelcontextprotocol/server-filesystem /tmp
+> /mcp list          # confirm it says "connected"
+> /mcp tools         # see read_file, list_directory, etc.
+> list the files in /tmp
+
+  --- Offline MCP test server (no network/npm needed) ---
+ > /mcp add test env/bin/python3 src/test_mcp_server.py
+ > /mcp tools
+ > what is 17 plus 25?
+
+ > /mcp add gcr npx -y git-codereview
+> /mcp tools
+> review the staged changes in 
 
 git diff | python heybro.py --provider moonshot --single -
 or, combine an instruction with piped context:
