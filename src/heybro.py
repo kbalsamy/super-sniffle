@@ -32,7 +32,7 @@ try:
 except ImportError:  # 'mcp' package not installed
     MCP_AVAILABLE = False
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from openai import OpenAI
@@ -912,7 +912,7 @@ class UniversalAICli:
             f"[dim]Model: {escape(display_model)}[/dim]\n"
             f"{arn_line}"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /aws-cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -1380,6 +1380,68 @@ class UniversalAICli:
             ),
         })
 
+    def _get_bedrock_unblended_cost_mtd(self) -> dict:
+        """Fetch this month's actual AWS Bedrock unblended cost via Cost Explorer.
+
+        Cost Explorer is a global service reachable only from us-east-1, and its
+        data typically lags live usage by up to ~24h, so this reflects billed
+        cost, not the estimate _record_usage tracks from token counts.
+        """
+        import boto3
+
+        session_kwargs = {}
+        if self.profile:
+            session_kwargs["profile_name"] = self.profile
+        session = boto3.Session(**session_kwargs)
+        ce_client = session.client("ce", region_name="us-east-1")
+
+        today = date.today()
+        start = today.replace(day=1)
+        end_exclusive = today + timedelta(days=1)
+
+        response = ce_client.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            Filter={"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Bedrock"]}},
+        )
+
+        results = response.get("ResultsByTime", [])
+        if not results:
+            return {"amount": 0.0, "unit": "USD", "start": start.isoformat(), "end": today.isoformat()}
+        total = results[0]["Total"]["UnblendedCost"]
+        return {
+            "amount": float(total["Amount"]),
+            "unit": total["Unit"],
+            "start": start.isoformat(),
+            "end": today.isoformat(),
+        }
+
+    def _show_aws_bedrock_cost(self):
+        try:
+            data = self._get_bedrock_unblended_cost_mtd()
+        except Exception as e:
+            self.console.print(f"[red]Could not fetch AWS Cost Explorer data: {escape(str(e))}[/red]")
+            self.console.print(
+                "[dim]Requires AWS credentials with the 'ce:GetCostAndUsage' permission "
+                "(this is separate from bedrock:InvokeModel).[/dim]"
+            )
+            return
+
+        table = Table(box=box.SIMPLE, border_style="green", show_header=False)
+        table.add_column("", style="dim")
+        table.add_column("", justify="right")
+        table.add_row("Period", f"{data['start']} to {data['end']} (month-to-date)")
+        table.add_row("Bedrock Unblended Cost", f"${data['amount']:.2f} {data['unit']}")
+
+        self.console.print(
+            Panel(table, title="💵 AWS Bedrock Cost (Cost Explorer)", border_style="green", expand=False)
+        )
+        self.console.print(
+            "[dim]Actual billed cost from AWS Cost Explorer (~24h reporting lag); "
+            "use /cost for this session's live token-based estimate.[/dim]"
+        )
+
     def _handle_mcp_command(self, args_str: str):
         if not MCP_AVAILABLE:
             self.console.print(
@@ -1479,6 +1541,10 @@ class UniversalAICli:
             self.tracker.display_session_summary(self.console)
             return True
 
+        elif cmd == "/aws-cost":
+            self._show_aws_bedrock_cost()
+            return True
+
         elif cmd == "/context":
             status = self.context_manager.get_status(self.messages)
             table = Table(box=box.SIMPLE, border_style="blue", show_header=False)
@@ -1564,7 +1630,7 @@ class UniversalAICli:
         elif cmd.startswith("/"):
             self.console.print(
                 "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
-                "/history, /stats, /cost, /context, /model <name>, /model-arn <arn|clear>, "
+                "/history, /stats, /cost, /aws-cost, /context, /model <name>, /model-arn <arn|clear>, "
                 "/read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/yellow]"
             )
             return True

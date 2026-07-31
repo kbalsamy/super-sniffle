@@ -18,6 +18,9 @@ export AWS_ACCESS_KEY_ID="your-key"
   --- View all-time stats ---
  > /stats
 
+  --- Actual AWS Bedrock cost this month (Cost Explorer, requires ce:GetCostAndUsage) ---
+ > /aws-cost
+
   --- Register an MCP tool server (stdio) ---
  > /mcp add fs npx -y @modelcontextprotocol/server-filesystem /path/to/allow
  > /mcp list
@@ -55,6 +58,13 @@ Bedrock policy
         "bedrock:InvokeModelWithResponseStream"
       ],
       "Resource": "arn:aws:bedrock:*::foundation-model/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetCostAndUsage"
+      ],
+      "Resource": "*"
     }
   ]
 
