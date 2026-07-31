@@ -252,7 +252,8 @@ class MCPManager:
     @staticmethod
     def _default_servers() -> dict:
         """Always-registered servers: filesystem access to cwd, git code review,
-        and desktop-commander (terminal + file editing)."""
+        desktop-commander (terminal + file editing), and a knowledge-graph
+        memory store (entities/relations persisted across sessions)."""
         return {
             "fs": {
                 "command": "npx",
@@ -268,6 +269,13 @@ class MCPManager:
                 "command": "npx",
                 "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
                 "env": {},
+            },
+            "memory": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-memory"],
+                "env": {
+                    "MEMORY_FILE_PATH": os.path.expanduser("~/.ai_cli_memory.json"),
+                },
             },
         }
 
