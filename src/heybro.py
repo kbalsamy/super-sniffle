@@ -8,9 +8,15 @@ Tracks usage and persists to local JSON file.
 import os
 import sys
 import json
+import atexit
 import argparse
 import subprocess
 from typing import Optional
+
+try:
+    import readline
+except ImportError:  # not available on some platforms (e.g. Windows)
+    readline = None
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -534,6 +540,8 @@ class UniversalAICli:
         self.console = Console()
         self.messages: list[dict] = []
         self.history_file = os.path.expanduser(f"~/.ai_cli_{provider}_history")
+        self.input_history_file = os.path.expanduser(f"~/.ai_cli_{provider}_input_history")
+        self._init_input_history()
 
         # Context window management
         self.context_manager = ContextWindowManager(self.config.model)
@@ -547,6 +555,25 @@ class UniversalAICli:
             self._init_bedrock()
         else:
             self._init_openai()
+
+    def _init_input_history(self):
+        """Enable up/down-arrow recall of previously typed input, persisted across runs."""
+        if readline is None:
+            return
+        try:
+            readline.read_history_file(self.input_history_file)
+        except (FileNotFoundError, OSError):
+            pass
+        readline.set_history_length(1000)
+        atexit.register(self._save_input_history)
+
+    def _save_input_history(self):
+        if readline is None:
+            return
+        try:
+            readline.write_history_file(self.input_history_file)
+        except OSError:
+            pass
 
     def _init_openai(self):
         client_kwargs = {"base_url": self.config.base_url}
