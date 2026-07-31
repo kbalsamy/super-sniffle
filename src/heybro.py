@@ -251,7 +251,8 @@ class MCPManager:
 
     @staticmethod
     def _default_servers() -> dict:
-        """Always-registered servers: filesystem access to cwd + git code review."""
+        """Always-registered servers: filesystem access to cwd, git code review,
+        and desktop-commander (terminal + file editing)."""
         return {
             "fs": {
                 "command": "npx",
@@ -261,6 +262,11 @@ class MCPManager:
             "gcr": {
                 "command": "npx",
                 "args": ["-y", "git-codereview"],
+                "env": {},
+            },
+            "desktop-commander": {
+                "command": "npx",
+                "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
                 "env": {},
             },
         }
@@ -324,10 +330,13 @@ class MCPManager:
             return session, result.tools
 
         try:
-            session, tools = self._run(_connect())
+            # 90s: first-time `npx` runs have to download/install the package,
+            # which for larger servers (e.g. desktop-commander) can take a while.
+            session, tools = self._run(_connect(), timeout=90)
         except Exception as e:
-            self.errors[name] = str(e)
-            self.console.print(f"[red]MCP server '{name}' failed to connect: {escape(str(e))}[/red]")
+            message = str(e) or f"{type(e).__name__} (may be a slow first-time npx install; try again)"
+            self.errors[name] = message
+            self.console.print(f"[red]MCP server '{name}' failed to connect: {escape(message)}[/red]")
             return
 
         self.errors.pop(name, None)

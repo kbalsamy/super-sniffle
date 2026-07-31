@@ -22,12 +22,13 @@ export AWS_ACCESS_KEY_ID="your-key"
  > /aws-cost
 
   --- MCP tool servers (stdio) ---
- fs (@modelcontextprotocol/server-filesystem, scoped to cwd) and gcr (git-codereview)
- are registered automatically the first time you run heybro for a given --provider.
- Remove either with /mcp remove <name>; that sticks across future runs.
+ fs (@modelcontextprotocol/server-filesystem, scoped to cwd), gcr (git-codereview),
+ and desktop-commander (terminal + file editing — broad access, can run shell
+ commands) are registered automatically the first time you run heybro for a given
+ --provider. Remove any with /mcp remove <name>; that sticks across future runs.
  > /mcp list
  > /mcp tools
- > /mcp remove fs
+ > /mcp remove desktop-commander
 
  > /mcp add fs npx -y @modelcontextprotocol/server-filesystem /tmp
 > /mcp list          # confirm it says "connected"
