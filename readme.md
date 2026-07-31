@@ -21,8 +21,10 @@ export AWS_ACCESS_KEY_ID="your-key"
   --- Actual AWS Bedrock cost this month (Cost Explorer, requires ce:GetCostAndUsage) ---
  > /aws-cost
 
-  --- Register an MCP tool server (stdio) ---
- > /mcp add fs npx -y @modelcontextprotocol/server-filesystem /path/to/allow
+  --- MCP tool servers (stdio) ---
+ fs (@modelcontextprotocol/server-filesystem, scoped to cwd) and gcr (git-codereview)
+ are registered automatically the first time you run heybro for a given --provider.
+ Remove either with /mcp remove <name>; that sticks across future runs.
  > /mcp list
  > /mcp tools
  > /mcp remove fs

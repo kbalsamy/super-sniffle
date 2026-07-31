@@ -224,7 +224,15 @@ class MCPManager:
     def __init__(self, config_file: str, console: Console):
         self.config_file = config_file
         self.console = console
-        self.servers: dict[str, dict] = self._load_config()
+        if os.path.exists(self.config_file):
+            self.servers: dict[str, dict] = self._load_config()
+        else:
+            # First run for this provider: seed the always-on default servers
+            # so filesystem access and git code review work without manual
+            # /mcp add. Once saved, this file is authoritative — removing a
+            # server via /mcp remove keeps it gone on later runs.
+            self.servers = self._default_servers()
+            self._save_config()
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -240,6 +248,22 @@ class MCPManager:
                 self._connect_one(name, cfg)
 
     # ---- config persistence ----
+
+    @staticmethod
+    def _default_servers() -> dict:
+        """Always-registered servers: filesystem access to cwd + git code review."""
+        return {
+            "fs": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", os.getcwd()],
+                "env": {},
+            },
+            "gcr": {
+                "command": "npx",
+                "args": ["-y", "git-codereview"],
+                "env": {},
+            },
+        }
 
     def _load_config(self) -> dict:
         if os.path.exists(self.config_file):
