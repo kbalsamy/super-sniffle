@@ -24,4 +24,5 @@ env/
 .coverage
 htmlcov/
 
+knowledge-base/
 localreadme.md
