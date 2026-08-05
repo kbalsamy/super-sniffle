@@ -23,12 +23,13 @@ export AWS_ACCESS_KEY_ID="your-key"
 
   --- MCP tool servers (stdio) ---
  fs (@modelcontextprotocol/server-filesystem, scoped to cwd), gcr (git-codereview),
- and desktop-commander (terminal + file editing — broad access, can run shell
- commands) are registered automatically the first time you run heybro for a given
- --provider. Remove any with /mcp remove <name>; that sticks across future runs.
+ memory (persistent knowledge graph across sessions), desktop-commander (terminal +
+ file editing), and bash (@ag-bash/mcp-server, sandboxed bash with 70 agentic tools)
+ are registered automatically the first time you run heybro for a given --provider.
+ Remove any with /mcp remove <name>; that sticks across future runs.
  > /mcp list
  > /mcp tools
- > /mcp remove desktop-commander
+ > /mcp remove bash
 
  > /mcp add fs npx -y @modelcontextprotocol/server-filesystem /tmp
 > /mcp list          # confirm it says "connected"
@@ -81,3 +82,5 @@ review() {
 
 Inference ARN:                                                                                                        │
 │ arn:aws:bedrock:ap-south-1:<Account-id>:inference-profile/apac.anthropic.claude-3-5-sonnet-20240620-v1:0 
+arn:aws:bedrock:ap-south-1:<Accunt-id>:application-inference-profile/
+eg7krioj0qsm-j0qsm-hfihewi8892snnk=6ardjugw2agr=ka 

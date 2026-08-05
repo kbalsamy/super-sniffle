@@ -964,16 +964,15 @@ class UniversalAICli:
         input_tokens, output_tokens = 0, 0
 
         if streamed:
-            # For streaming, we try to get usage from the final chunk
-            # OpenAI: usage is in the last chunk if stream_options.include_usage=True
-            # Bedrock: usage is in the final metadata event
-            pass  # We'll estimate or get from non-stream if possible
+            # For streaming, we handle usage in the specific streaming methods
+            # (_bedrock_stream_chat and _openai_stream_chat)
+            return
         else:
             input_tokens, output_tokens = self._extract_usage(response)
 
         if input_tokens or output_tokens:
             self.tracker.record_turn(input_tokens, output_tokens, self.config.model)
-            # self.tracker.display_session_summary(self.console)
+            self._display_token_usage(input_tokens, output_tokens)
 
     def _stream_chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
@@ -1100,7 +1099,7 @@ class UniversalAICli:
         # Record usage
         if total_input_tokens or total_output_tokens:
             self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
-            # self.tracker.display_session_summary(self.console)
+            self._display_token_usage(total_input_tokens, total_output_tokens)
 
         return final_content
 
@@ -1212,9 +1211,13 @@ class UniversalAICli:
 
         if total_input_tokens or total_output_tokens:
             self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
-            # self.tracker.display_session_summary(self.console)
+            self._display_token_usage(total_input_tokens, total_output_tokens)
 
         return final_content
+
+    def _display_token_usage(self, input_tokens: int, output_tokens: int):
+        total_tokens = input_tokens + output_tokens
+        self.console.print(f"\n[bold blue]Token Usage:[/bold blue] Input: {input_tokens}, Output: {output_tokens}, Total: {total_tokens}")
 
     def _non_stream_chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
@@ -1356,7 +1359,7 @@ class UniversalAICli:
         # Record usage
         if total_input_tokens or total_output_tokens:
             self.tracker.record_turn(total_input_tokens, total_output_tokens, self.config.model)
-            # self.tracker.display_session_summary(self.console)
+            self._display_token_usage(total_input_tokens, total_output_tokens)
 
         return final_text
 
