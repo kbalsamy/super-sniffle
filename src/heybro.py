@@ -544,10 +544,16 @@ class UsageTracker:
 
     def __init__(self, data_dir: Optional[Path] = None):
         self.data_dir = data_dir or Path.home() / ".ai_cli"
-        self.data_dir.mkdir(exist_ok=True)
+        self.data_dir.mkdir(exist_ok=True, parents=True)
         self.usage_file = self.data_dir / "usage_history.json"
+        # Load previously persisted sessions. ``self.sessions`` stores a list of
+        # dictionary representations of ``SessionUsage`` objects.  If a session
+        # was started but never properly ended (e.g. the process crashed), it
+        # will be missing an ``end_time`` field.  In that case we treat it as the
+        # active session so that usage can continue to be recorded.
         self.sessions: list[dict] = self._load()
         self.current_session: Optional[SessionUsage] = None
+        self._recover_incomplete_session()
 
     def _load(self) -> list[dict]:
         if self.usage_file.exists():
@@ -562,6 +568,35 @@ class UsageTracker:
         with open(self.usage_file, "w", encoding="utf-8") as f:
             json.dump(self.sessions, f, indent=2, ensure_ascii=False)
 
+    # ---------------------------------------------------------------------
+    # Session recovery helpers
+    # ---------------------------------------------------------------------
+    def _recover_incomplete_session(self) -> None:
+        """Detect an unfinished session from the persisted data.
+
+        ``SessionUsage`` objects are stored as plain dictionaries. When a session
+        is finished ``end_session`` adds an ``end_time`` entry before persisting.
+        If a crash occurs the last entry will lack this key – we interpret that
+        as a session that should be resumed. The recovered session is
+        re-instantiated as a ``SessionUsage`` instance and assigned to
+        ``self.current_session``. It is also removed from ``self.sessions`` to
+        avoid double‑counting when ``end_session`` is eventually called.
+        """
+
+        if not self.sessions:
+            return
+
+        # Look for the most recent session missing ``end_time``.
+        for i in range(len(self.sessions) - 1, -1, -1):
+            sess_dict = self.sessions[i]
+            if "end_time" not in sess_dict:
+                # Re-create the dataclass instance from the dict.
+                self.current_session = SessionUsage(**sess_dict)
+                # Remove from persisted list; it will be re‑added on end.
+                del self.sessions[i]
+                # Save the corrected list immediately to keep the file clean.
+                self._save()
+                break
     def start_session(self, provider: str, model: str):
         self.current_session = SessionUsage(provider=provider, model=model)
 
@@ -790,6 +825,7 @@ class UniversalAICli:
         region: str = "ap-south-1",
         profile: Optional[str] = None,
         model_arn: Optional[str] = None,
+        working_dir: Optional[Path] = None,
     ):
         self.config = PROVIDERS.get(provider, PROVIDERS["custom"])
         self.provider_name = provider
@@ -808,19 +844,32 @@ class UniversalAICli:
 
         self.console = Console()
         self.messages: list[dict] = []
-        self.history_file = os.path.expanduser(f"~/.ai_cli_{provider}_history")
-        self.input_history_file = os.path.expanduser(f"~/.ai_cli_{provider}_input_history")
+        
+        # Set up working directory and file paths
+        if working_dir:
+            self.working_dir = Path(working_dir).expanduser().resolve()
+            self.working_dir.mkdir(parents=True, exist_ok=True)
+            self.history_file = str(self.working_dir / f"ai_cli_{provider}_history")
+            self.input_history_file = str(self.working_dir / f"ai_cli_{provider}_input_history")
+            self.mcp_config_file = str(self.working_dir / f"ai_cli_{provider}_mcp_servers.json")
+            self.tracker = UsageTracker(self.working_dir)
+        else:
+            # Legacy behavior - use home directory
+            self.working_dir = None
+            self.history_file = os.path.expanduser(f"~/.ai_cli_{provider}_history")
+            self.input_history_file = os.path.expanduser(f"~/.ai_cli_{provider}_input_history")
+            self.mcp_config_file = os.path.expanduser(f"~/.ai_cli_{provider}_mcp_servers.json")
+            self.tracker = UsageTracker()
+        
         self._init_input_history()
 
         # Context window management
         self.context_manager = ContextWindowManager(self.config.model)
 
         # Token & cost tracking
-        self.tracker = UsageTracker()
         self.tracker.start_session(provider, self.config.model)
 
         # MCP server registry (tool-calling)
-        self.mcp_config_file = os.path.expanduser(f"~/.ai_cli_{provider}_mcp_servers.json")
         self.mcp = MCPManager(self.mcp_config_file, self.console)
         atexit.register(self.mcp.shutdown)
 
@@ -1367,7 +1416,13 @@ class UniversalAICli:
         if not file_path:
             self.console.print("[red]Usage: /read <file_path>[/red]")
             return
-        path = Path(file_path).expanduser()
+        
+        # If file_path is relative and we have a working directory, resolve relative to working directory
+        path = Path(file_path)
+        if not path.is_absolute() and self.working_dir:
+            path = self.working_dir / path
+        
+        path = path.expanduser().resolve()
         try:
             content = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -1762,6 +1817,11 @@ def main():
     )
     parser.add_argument("--region", default="us-east-1", help="AWS region (for Bedrock)")
     parser.add_argument("--profile", help="AWS profile (for Bedrock)")
+    parser.add_argument(
+        "--directory", "-d",
+        metavar="PATH",
+        help="Working directory for storing history, configs, and data files",
+    )
     args = parser.parse_args()
 
     stdin_content = None
@@ -1790,6 +1850,7 @@ def main():
             region=args.region,
             profile=args.profile,
             model_arn=args.model_arn,
+            working_dir=args.directory,
         )
     except ValueError as e:
         print(f"Error: {e}")
