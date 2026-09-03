@@ -63,7 +63,7 @@ PROVIDERS = {
     "bedrock": ProviderConfig(
         name="AWS Bedrock",
         base_url="",
-        model="moonshot.kimi-k2-thinking",
+        model="",
         api_key_env="AWS_ACCESS_KEY_ID",
         is_bedrock=True,
     ),

@@ -231,7 +231,7 @@ class UniversalAICli:
             f"[dim]Model: {escape(display_model)}[/dim]\n"
             f"{arn_line}"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /aws-cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /aws-cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /vim, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -708,6 +708,64 @@ class UniversalAICli:
             ),
         })
 
+    def _open_vim_editor(self):
+        """Open Vim editor to paste/edit long context."""
+        import tempfile
+        import subprocess
+        import os
+        
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False) as temp:
+            temp_path = temp.name
+            # Write instructions as a header
+            temp.write("# Paste your long context here\n")
+            temp.write("# Lines starting with '#' will be ignored\n")
+            temp.write("# Save and exit Vim to use the content (:wq)\n")
+            temp.write("# Cancel by exiting without saving (:q!)\n\n")
+        
+        try:
+            # Check if vim is available
+            if subprocess.run(['which', 'vim'], capture_output=True).returncode != 0:
+                self.console.print("[red]Error: vim not found. Please install vim.[/red]")
+                return
+            
+            # Open Vim with the temporary file
+            result = subprocess.run(['vim', temp_path])
+            
+            # Read the content after Vim closes
+            with open(temp_path, 'r') as f:
+                content = f.read()
+            
+            # Filter out comment lines (starting with #)
+            lines = []
+            for line in content.split('\n'):
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#'):
+                    lines.append(line)
+            
+            filtered_content = '\n'.join(lines)
+            
+            if filtered_content.strip():
+                self.messages.append({
+                    "role": "user", 
+                    "content": filtered_content
+                })
+                line_count = filtered_content.count('\n') + 1
+                self.console.print(
+                    f"[green]Loaded {line_count} lines from Vim editor into context.[/green]"
+                )
+            else:
+                self.console.print("[yellow]No content loaded from Vim (cancelled or empty).[/yellow]")
+                
+        except Exception as e:
+            self.console.print(f"[red]Error opening vim: {escape(str(e))}[/red]")
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
     def _get_bedrock_unblended_cost_mtd(self) -> dict:
         """Fetch this month's actual AWS Bedrock unblended cost via Cost Explorer.
 
@@ -831,6 +889,10 @@ class UniversalAICli:
             self.tracker.end_session()
             self.console.print("[dim]Goodbye! 👋[/dim]")
             return False
+
+        elif cmd == "/vim":
+            self._open_vim_editor()
+            return True
 
         elif cmd == "/clear":
             self.messages = []
@@ -959,7 +1021,7 @@ class UniversalAICli:
             self.console.print(
                 "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
                 "/history, /stats, /cost, /aws-cost, /context, /model <name>, /model-arn <arn|clear>, "
-                "/read <path>, /run <cmd>, /mcp add|remove|list|tools, /quit[/yellow]"
+                "/read <path>, /run <cmd>, /mcp add|remove|list|tools, /vim, /quit[/yellow]"
             )
             return True
 
