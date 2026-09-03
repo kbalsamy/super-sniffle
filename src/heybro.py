@@ -19,6 +19,11 @@ try:
 except ImportError:  # not available on some platforms (e.g. Windows)
     readline = None
 
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
+
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -231,7 +236,7 @@ class UniversalAICli:
             f"[dim]Model: {escape(display_model)}[/dim]\n"
             f"{arn_line}"
             f"[dim]Pricing: {cost_info}[/dim]\n"
-            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /aws-cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /vim, /quit[/dim]",
+            f"[dim]Commands: /clear, /clear-console, /save, /load, /history, /stats, /cost, /aws-cost, /context, /model, /model-arn <arn>, /read <path>, /run <cmd>, /mcp add|remove|list|tools, /vim, /copy, /quit[/dim]",
             title="Universal AI CLI",
             border_style="cyan",
         )
@@ -708,6 +713,32 @@ class UniversalAICli:
             ),
         })
 
+    def _copy_last_response(self):
+        """Copy the last assistant response to clipboard."""
+        if not self.messages:
+            self.console.print("[yellow]No messages to copy.[/yellow]")
+            return
+        
+        if pyperclip is None:
+            self.console.print(
+                "[red]Clipboard support requires pyperclip: pip install pyperclip[/red]"
+            )
+            return
+        
+        # Find the last assistant message
+        for msg in reversed(self.messages):
+            if msg["role"] == "assistant":
+                try:
+                    pyperclip.copy(msg["content"])
+                    preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+                    self.console.print(f"[green]✓ Copied to clipboard:[/green] {escape(preview)}")
+                    return
+                except Exception as e:
+                    self.console.print(f"[red]Failed to copy to clipboard: {escape(str(e))}[/red]")
+                    return
+        
+        self.console.print("[yellow]No assistant response found to copy.[/yellow]")
+
     def _open_vim_editor(self):
         """Open Vim editor to paste/edit long context."""
         import tempfile
@@ -717,7 +748,7 @@ class UniversalAICli:
         # Create a temporary file
         with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False) as temp:
             temp_path = temp.name
-            # Write instructions as a header
+            # Write instructions as a comment header
             temp.write("# Paste your long context here\n")
             temp.write("# Lines starting with '#' will be ignored\n")
             temp.write("# Save and exit Vim to use the content (:wq)\n")
@@ -729,10 +760,10 @@ class UniversalAICli:
                 self.console.print("[red]Error: vim not found. Please install vim.[/red]")
                 return
             
-            # Open Vim with the temporary file
+            # Open vim with the temporary file
             result = subprocess.run(['vim', temp_path])
             
-            # Read the content after Vim closes
+            # Read the content after vim closes
             with open(temp_path, 'r') as f:
                 content = f.read()
             
@@ -894,6 +925,10 @@ class UniversalAICli:
             self._open_vim_editor()
             return True
 
+        elif cmd == "/copy":
+            self._copy_last_response()
+            return True
+
         elif cmd == "/clear":
             self.messages = []
             self.console.print("[green]Conversation history cleared.[/green]")
@@ -1021,7 +1056,7 @@ class UniversalAICli:
             self.console.print(
                 "[yellow]Unknown command. Try: /clear, /clear-console, /save, /load, "
                 "/history, /stats, /cost, /aws-cost, /context, /model <name>, /model-arn <arn|clear>, "
-                "/read <path>, /run <cmd>, /mcp add|remove|list|tools, /vim, /quit[/yellow]"
+                "/read <path>, /run <cmd>, /mcp add|remove|list|tools, /vim, /copy, /quit[/yellow]"
             )
             return True
 
