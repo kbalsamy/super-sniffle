@@ -685,11 +685,29 @@ class UniversalAICli:
         if not command:
             self.console.print("[red]Usage: /run <command>[/red]")
             return
+        
+        # Restrict to allowed commands
+        ALLOWED_COMMANDS = {"ls", "cat", "grep", "find", "git", "pwd", "which", "head", "tail", "wc", "sort", "uniq"}  # example whitelist
+        cmd_parts = shlex.split(command)
+        if cmd_parts[0] not in ALLOWED_COMMANDS:
+            self.console.print(f"[red]Command '{cmd_parts[0]}' not allowed.[/red]")
+            return
+        
         try:
-            result = subprocess.run(shlex.split(command), capture_output=True, text=True, check=True)
+            # Use explicit shell=False and timeout
+            result = subprocess.run(
+                cmd_parts, 
+                capture_output=True, 
+                text=True, 
+                check=True,
+                timeout=30  # Add timeout to prevent hanging
+            )
             self.console.print(f"[green]Command output:[/green]\n{result.stdout}")
         except subprocess.CalledProcessError as e:
             self.console.print(f"[red]Command failed with error code {e.returncode}:[/red]\n{e.stderr}")
+        except subprocess.TimeoutExpired:
+            self.console.print("[red]Command timed out after 30 seconds.[/red]")
+            return
         except Exception as e:
             self.console.print(f"[red]Command failed: {escape(str(e))}[/red]")
             return
