@@ -138,7 +138,13 @@ class UniversalAICli:
             client_kwargs["api_key"] = self.api_key
         else:
             client_kwargs["api_key"] = "dummy"
-        self.client = OpenAI(**client_kwargs)
+        
+        # Add timeout to prevent hanging API calls
+        from openai import DefaultHttpxClient
+        self.client = OpenAI(
+            **client_kwargs,
+            http_client=DefaultHttpxClient(timeout=60.0)  # 60 second timeout
+        )
         self.bedrock_client = None
 
     def _init_bedrock(self):
