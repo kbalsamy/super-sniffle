@@ -784,10 +784,10 @@ class UniversalAICli:
                     temp_filename = tmp_file.name
                 
                 # Use toast notifier to indicate where the file is
-                notifier = ToastNotifier()
-                success_msg = f"Saved to temp file: {temp_filename}"
+                notifier = ToastNotifier(temp_filename)
+                success_msg = f"Copied {len(content)} characters to clipboard and saved to temp file"
                 if notifier.process_selection(success_msg):
-                    self.console.print(f"[green]✓ Saved to temp file:[/green] {escape(temp_filename)}")
+                    self.console.print(f"[green]✓ Copied to clipboard and saved to:[/green] {escape(temp_filename)}")
                 else:
                     self.console.print(f"[green]✓ Content saved to:[/green] {escape(temp_filename)}")
                 return
