@@ -24,6 +24,13 @@ try:
 except ImportError:
     pyperclip = None
 
+try:
+    from toast_notifier import ToastNotifier
+    TOAST_NOTIFIER_AVAILABLE = True
+except ImportError:
+    TOAST_NOTIFIER_AVAILABLE = False
+    ToastNotifier = None
+
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -738,28 +745,48 @@ class UniversalAICli:
         })
 
     def _copy_last_response(self):
-        """Copy the last assistant response to clipboard."""
+        """Copy the last assistant response to clipboard and file."""
         if not self.messages:
             self.console.print("[yellow]No messages to copy.[/yellow]")
             return
         
-        if pyperclip is None:
+        if pyperclip is None and not TOAST_NOTIFIER_AVAILABLE:
             self.console.print(
-                "[red]Clipboard support requires pyperclip: pip install pyperclip[/red]"
+                "[red]Clipboard support requires either pyperclip (pip install pyperclip) or toast_notifier[/red]"
             )
             return
         
         # Find the last assistant message
         for msg in reversed(self.messages):
             if msg["role"] == "assistant":
-                try:
-                    pyperclip.copy(msg["content"])
-                    preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-                    self.console.print(f"[green]✓ Copied to clipboard:[/green] {escape(preview)}")
-                    return
-                except Exception as e:
-                    self.console.print(f"[red]Failed to copy to clipboard: {escape(str(e))}[/red]")
-                    return
+                content = msg["content"]
+                preview = content[:100] + "..." if len(content) > 100 else content
+                
+                copied = False
+                # Try pyperclip first
+                if pyperclip is not None:
+                    try:
+                        pyperclip.copy(content)
+                        self.console.print(f"[green]✓ Copied to clipboard:[/green] {escape(preview)}")
+                        copied = True
+                    except Exception as e:
+                        self.console.print(f"[yellow]Failed to copy to clipboard: {escape(str(e))}[/yellow]")
+                
+                # Try toast notifier if available
+                if TOAST_NOTIFIER_AVAILABLE:
+                    try:
+                        notifier = ToastNotifier()
+                        if notifier.process_selection(content):
+                            self.console.print(f"[green]✓ Appended to file:[/green] {escape(preview)}")
+                            copied = True
+                        else:
+                            self.console.print("[yellow]Failed to append to file[/yellow]")
+                    except Exception as e:
+                        self.console.print(f"[yellow]Toast notifier failed: {escape(str(e))}[/yellow]")
+                
+                if not copied:
+                    self.console.print("[red]Failed to copy content[/red]")
+                return
         
         self.console.print("[yellow]No assistant response found to copy.[/yellow]")
 
