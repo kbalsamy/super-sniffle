@@ -745,50 +745,56 @@ class UniversalAICli:
         })
 
     def _copy_last_response(self):
-        """Copy the last assistant response to clipboard and file."""
+        """Copy the last assistant response to clipboard or temp file."""
         if not self.messages:
             self.console.print("[yellow]No messages to copy.[/yellow]")
             return
         
-        if pyperclip is None and not TOAST_NOTIFIER_AVAILABLE:
-            self.console.print(
-                "[red]Clipboard support requires either pyperclip (pip install pyperclip) or toast_notifier[/red]"
-            )
-            return
-        
         # Find the last assistant message
+        last_assistant_msg = None
         for msg in reversed(self.messages):
             if msg["role"] == "assistant":
-                content = msg["content"]
-                preview = content[:100] + "..." if len(content) > 100 else content
-                
-                copied = False
-                # Try pyperclip first
-                if pyperclip is not None:
-                    try:
-                        pyperclip.copy(content)
-                        self.console.print(f"[green]✓ Copied to clipboard:[/green] {escape(preview)}")
-                        copied = True
-                    except Exception as e:
-                        self.console.print(f"[yellow]Failed to copy to clipboard: {escape(str(e))}[/yellow]")
-                
-                # Try toast notifier if available
-                if TOAST_NOTIFIER_AVAILABLE:
-                    try:
-                        notifier = ToastNotifier()
-                        if notifier.process_selection(content):
-                            self.console.print(f"[green]✓ Appended to file:[/green] {escape(preview)}")
-                            copied = True
-                        else:
-                            self.console.print("[yellow]Failed to append to file[/yellow]")
-                    except Exception as e:
-                        self.console.print(f"[yellow]Toast notifier failed: {escape(str(e))}[/yellow]")
-                
-                if not copied:
-                    self.console.print("[red]Failed to copy content[/red]")
-                return
+                last_assistant_msg = msg
+                break
         
-        self.console.print("[yellow]No assistant response found to copy.[/yellow]")
+        if not last_assistant_msg:
+            self.console.print("[yellow]No assistant response found to copy.[/yellow]")
+            return
+            
+        content = last_assistant_msg["content"]
+        preview = content[:100] + "..." if len(content) > 100 else content
+        
+        # Try pyperclip first (clipboard)
+        if pyperclip is not None:
+            try:
+                pyperclip.copy(content)
+                self.console.print(f"[green]✓ Copied to clipboard:[/green] {escape(preview)}")
+                return
+            except Exception as e:
+                self.console.print(f"[yellow]Failed to copy to clipboard: {escape(str(e))}[/yellow]")
+        
+        # Fallback to toast notifier with temp file
+        if TOAST_NOTIFIER_AVAILABLE:
+            try:
+                import tempfile
+                import os
+                # Create a temporary file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp_file:
+                    tmp_file.write(content)
+                    temp_filename = tmp_file.name
+                
+                # Use toast notifier to indicate where the file is
+                notifier = ToastNotifier()
+                success_msg = f"Saved to temp file: {temp_filename}"
+                if notifier.process_selection(success_msg):
+                    self.console.print(f"[green]✓ Saved to temp file:[/green] {escape(temp_filename)}")
+                else:
+                    self.console.print(f"[green]✓ Content saved to:[/green] {escape(temp_filename)}")
+                return
+            except Exception as e:
+                self.console.print(f"[yellow]Toast notifier failed: {escape(str(e))}[/yellow]")
+        
+        self.console.print("[red]Failed to copy content - no available methods[/red]")
 
     def _open_vim_editor(self):
         """Open Vim editor to paste/edit long context."""

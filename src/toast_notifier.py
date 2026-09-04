@@ -14,11 +14,12 @@ import os
 import sys
 
 class ToastNotifier:
-    def __init__(self, output_file="./src/heybro.py"):
+    def __init__(self, output_file=None):
         self.console = Console()
         self.output_file = output_file
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
+        if self.output_file:
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
     
     async def show_toast(self, message, duration=3):
         """Display a toast notification for specified duration"""
@@ -45,6 +46,8 @@ class ToastNotifier:
     
     def copy_to_file(self, content):
         """Copy content to the specified output file"""
+        if not self.output_file:
+            return False
         try:
             with open(self.output_file, 'a', encoding='utf-8') as f:
                 f.write(content + '\n')
@@ -59,9 +62,13 @@ class ToastNotifier:
             # Copy to clipboard
             pyperclip.copy(selected_text)
             
-            # Append to file
-            if self.copy_to_file(selected_text):
+            # Append to file if specified
+            if self.output_file and self.copy_to_file(selected_text):
                 # Show toast notification
+                asyncio.run(self.show_toast(f"Copied {len(selected_text)} characters"))
+                return True
+            elif not self.output_file:
+                # Just clipboard copy
                 asyncio.run(self.show_toast(f"Copied {len(selected_text)} characters"))
                 return True
             else:
