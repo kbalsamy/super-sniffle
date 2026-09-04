@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heybro"
+version = "0.1.0"
+description = "Universal AI CLI with Token & Cost Tracking"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+requires-python = ">=3.8"
+keywords = ["ai", "cli", "openai", "aws-bedrock", "mcp", "chat", "llm"]
+dependencies = [
+    "rich>=13.0.0",
+    "openai>=1.0.0",
+    "boto3>=1.34.0",
+    "mcp>=1.0.0",
+    "pyperclip>=1.8.0",
+    "typing-extensions>=4.0.0; python_version<'3.10'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/username/heybro"
+Repository = "https://github.com/username/heybro.git"
+Issues = "https://github.com/username/heybro/issues"
+
+[project.scripts]
+heybro = "heybro:main"
+heythere = "heybro:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["heybro"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+heybro_app = ["*.json"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --cov=heybro --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.8"
+ignore_missing_imports = true

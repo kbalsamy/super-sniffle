@@ -56,7 +56,7 @@ class MCPManager:
         return {
             "fs": {
                 "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", os.getcwd()],
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "${CWD}"],
                 "env": {},
             },
             "gcr": {
@@ -121,9 +121,13 @@ class MCPManager:
         stack = AsyncExitStack()
 
         async def _connect():
+            resolved_args = [
+                os.getcwd() if arg == "${CWD}" else arg
+                for arg in cfg.get("args", [])
+            ]
             params = StdioServerParameters(
                 command=cfg["command"],
-                args=cfg.get("args", []),
+                args=resolved_args,
                 env=cfg.get("env") or None,
             )
             read, write = await stack.enter_async_context(stdio_client(params))
@@ -243,4 +247,3 @@ class MCPManager:
                 escape(self.tool_descriptions.get(prefixed, "")[:80]),
             )
         return table
-
